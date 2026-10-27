@@ -1,0 +1,15 @@
+{
+  "name": "wicket",
+  "displayName": "Wicket",
+  "version": "2.3.0",
+  "description": "Work with Microsoft Dynamics 365 Business Central through Wicket: the wicket_* MCP tools, the Wicket usage skill, and /wicket:orient and /wicket:inventory.",
+  "author": {
+    "name": "Dave The Wicketkeeper"
+  },
+  "keywords": [
+    "business-central",
+    "dynamics-365",
+    "erp",
+    "mcp"
+  ]
+}

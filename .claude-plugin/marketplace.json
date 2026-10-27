@@ -1,0 +1,12 @@
+{
+  "name": "wicket",
+  "owner": { "name": "Dave The Wicketkeeper" },
+  "description": "Wicket for Claude Code: Business Central through a governed endpoint.",
+  "plugins": [
+    {
+      "name": "wicket",
+      "source": "./plugin",
+      "description": "The wicket_* MCP tools, the Wicket usage skill, and /wicket:orient and /wicket:inventory."
+    }
+  ]
+}

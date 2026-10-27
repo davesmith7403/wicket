@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Bun
+bun.lockb
+.bun/
+
+# Local environment / secrets — never commit credentials
+.env
+.env.local
+.env.*.local
+
+# Build / cache
+dist/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log

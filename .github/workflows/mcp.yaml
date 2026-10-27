@@ -1,0 +1,41 @@
+name: MCP typecheck and test
+
+# The AL-Go workflows build the AL apps but never touch the Bun/TypeScript MCP server in mcp/.
+# This job typechecks it AND runs its test suite (mcp/test — real server construction over the SDK's
+# in-memory transport with a stubbed fetch), so neither an SDK-breaking change nor a behavioral
+# regression can ship silently. A failing assertion fails the job; typecheck alone never caught those.
+# skills/wicket-usage is watched too: the suite byte-compares it with the bundled mcp/skill copy.
+# plugin/ is watched because the suite checks its skill copy and its server bundle's source hash.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mcp/**'
+      - 'skills/wicket-usage/**'
+      - 'plugin/**'
+      - '.github/workflows/mcp.yaml'
+  pull_request:
+    paths:
+      - 'mcp/**'
+      - 'skills/wicket-usage/**'
+      - 'plugin/**'
+      - '.github/workflows/mcp.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13   # the version the suite was recorded green on locally
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
