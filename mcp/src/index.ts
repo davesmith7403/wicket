@@ -86,7 +86,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.4.2';
+export const SERVER_VERSION = '2.4.3';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;

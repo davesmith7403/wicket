@@ -113,7 +113,7 @@ const ConnectionEntry = z.object({
     companyId: z
         .string()
         .regex(GUID_RE, 'must be a brace-less GUID (it is interpolated into the request URL)'),
-    /** Optional allowlist of company GUIDs this connection may target (defense in depth). */
+    /** Optional list of the company GUIDs this connection may target, its permitted companies (defense in depth). */
     companies: z.array(z.string()).optional(),
     /**
      * "client_credentials" (default) uses a service-principal secret; "device_code" and
@@ -199,8 +199,8 @@ function assertCompanyAllowed(spec: ConnectionSpec): void {
     const ok = spec.companies.some((c) => c.toLowerCase() === spec.companyId.toLowerCase());
     if (!ok) {
         throw new Error(
-            `Connection "${spec.name}": companyId ${spec.companyId} is not in this connection's ` +
-                `companies allowlist (${spec.companies.join(', ')}).`,
+            `Connection "${spec.name}": companyId ${spec.companyId} is not among this connection's ` +
+                `permitted companies (${spec.companies.join(', ')}).`,
         );
     }
 }

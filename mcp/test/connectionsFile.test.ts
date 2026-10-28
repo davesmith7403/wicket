@@ -85,7 +85,7 @@ describe('upsertConnection', () => {
         const before = readFileSync(file, 'utf8');
         expect(() =>
             upsertConnection('a', { companyId: COMPANY_B }, { replace: true, validate: (name, merged) => validateConnectionEntry(name, merged) }),
-        ).toThrow(/not in this connection's companies allowlist/);
+        ).toThrow(/not among this connection's permitted companies/);
         expect(readFileSync(file, 'utf8')).toBe(before);
     });
 

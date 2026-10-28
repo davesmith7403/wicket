@@ -12,7 +12,7 @@ Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`
 
 ## wicket_capabilities
 
-The endpoint's self-description (about 5 KB). Read: `limits` (`defaultTop` 100, `maxTop` 1000, `scanBudget` 100000, `maxInMembers` 20, `maxSelectFields`, `maxFilterLength`), `readOnly`, `exposureMode` (`Open` or `Allowlisted`), `fieldPolicy` (mode, classification verdicts, your `principal` grants), `apiRouting.mode` (`Prefer` allows `wicket_api_read`; `Off` means `wicket_query` only), `async.enabled` (whether `wicket_query_deliver` can work), `actions` (every enrolled business verb with `enabled`, `mutating`, `previewSupported` and `argsSchema`; empty means no action companion is installed, `enabled: false` means an administrator has not allowed that verb), `structureVersion` (moves when apps change). Once per connection per session, and again after `wicket_use`.
+The endpoint's self-description (about 5 KB). Read: `limits` (`defaultTop` 100, `maxTop` 1000, `scanBudget` 100000, `maxInMembers` 20, `maxSelectFields`, `maxFilterLength`), `readOnly`, `exposureMode` (`Open`, or `Allowlisted` for the mode Exposed tables only), `fieldPolicy` (mode, classification verdicts, your `principal` grants), `apiRouting.mode` (`Prefer` allows `wicket_api_read`; `Off` means `wicket_query` only), `async.enabled` (whether `wicket_query_deliver` can work), `actions` (every enrolled business verb with `enabled`, `mutating`, `previewSupported` and `argsSchema`; empty means no action companion is installed, `enabled: false` means an administrator has not allowed that verb), `structureVersion` (moves when apps change). Once per connection per session, and again after `wicket_use`.
 
 ## wicket_map
 

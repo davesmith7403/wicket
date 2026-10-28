@@ -32,7 +32,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 
 | Slug | Cause | Do |
 |---|---|---|
-| `not-exposed` | The table or codeunit is not enrolled in Wicket Exposure (Allowlisted mode), or your BC permissions lack it; also gates `pageUrl` and `deliver` | An administrator enrols it or switches the mode; `describe` to confirm permissions |
+| `not-exposed` | The table or codeunit is not enrolled in Wicket Exposure (mode Exposed tables only), or your BC permissions lack it; also gates `pageUrl` and `deliver` | An administrator enrols it or switches the mode; `describe` to confirm permissions |
 | `field-restricted` | You named a field the policy hides (`select`, `filter`, `orderBy`, `aggregate`, `readBlob`, a write), an index whose later field is hidden, or a non-existent field number | Drop it; `describe` shows what is readable and writable |
 | `field-masked` | A masked field in `filter`, `orderBy`, `aggregate`, an effective key, the modified window or `readBlob` | Drop the masked field from that clause |
 | `read-only` | A write or a mutating `action` while the endpoint is read-only (an action preview and a `mutating: false` verb still run) | Reads and previews only until an administrator lifts it; check `capabilities.readOnly` |

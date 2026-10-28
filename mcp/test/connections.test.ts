@@ -315,9 +315,9 @@ describe('ConnectionRegistry.load from connections.json', () => {
         );
     });
 
-    test('a companies allowlist must contain the pinned companyId (case-insensitive)', () => {
+    test('permitted companies must contain the pinned companyId (case-insensitive)', () => {
         expect(rejection({ connections: { a: entry({ companies: [COMPANY_B] }) } }, 'a')).toMatch(
-            /not in this connection's companies allowlist/,
+            /not among this connection's permitted companies/,
         );
         const reg = loadRegistry(tmp, {
             connections: { a: entry({ companies: [COMPANY_B, COMPANY_A.toUpperCase()] }) },

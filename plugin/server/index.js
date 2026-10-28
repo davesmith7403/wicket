@@ -42587,7 +42587,7 @@ function assertCompanyAllowed(spec) {
     return;
   const ok = spec.companies.some((c) => c.toLowerCase() === spec.companyId.toLowerCase());
   if (!ok) {
-    throw new Error(`Connection "${spec.name}": companyId ${spec.companyId} is not in this connection's ` + `companies allowlist (${spec.companies.join(", ")}).`);
+    throw new Error(`Connection "${spec.name}": companyId ${spec.companyId} is not among this connection's ` + `permitted companies (${spec.companies.join(", ")}).`);
   }
 }
 function assertSecretSource(spec) {
@@ -43277,7 +43277,7 @@ function planApiRead(api2, req) {
       slug: "api-not-routable",
       status: 403,
       title: "API read not allowed",
-      detail: reason === "routing-off" ? "API routing is Off in Wicket Setup, so reads go through the dynamic plane. Use wicket_query on the source table." : reason === "not-exposed" ? `Wicket does not let this caller read table ${api2.sourceTableId ?? "?"} (exposure allowlist or BC permissions), so its API cannot be used either.` : `This API cannot be pre-checked against Wicket's field policy (${reason}). Use wicket_query on the source table.`,
+      detail: reason === "routing-off" ? "API routing is Off in Wicket Setup, so reads go through the dynamic plane. Use wicket_query on the source table." : reason === "not-exposed" ? `Wicket does not let this caller read table ${api2.sourceTableId ?? "?"} (the table is not exposed in Wicket, or BC permissions lack it), so its API cannot be used either.` : `This API cannot be pre-checked against Wicket's field policy (${reason}). Use wicket_query on the source table.`,
       suggest: { use: "wicket_query", ...api2.sourceTableId !== undefined ? { tableId: api2.sourceTableId } : {}, reason }
     };
   }
@@ -44341,7 +44341,7 @@ function explainAuthError(err) {
 }
 
 // src/index.ts
-var SERVER_VERSION = "2.4.2";
+var SERVER_VERSION = "2.4.3";
 var RPC_TIMEOUT_MS = 120000;
 var MUTATING_OPERATIONS = new Set(["insert", "modify", "delete", "invoke", "action"]);
 var UNMASK_AWARE_OPERATIONS = new Set(["query", "readBlob", "describe"]);

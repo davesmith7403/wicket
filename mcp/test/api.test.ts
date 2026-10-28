@@ -271,6 +271,13 @@ describe('wicket_api_read', () => {
         expect(out['@nextSkip']).toBe(6);
     });
 
+    test('an API over a table that is not exposed says so in the words of the Exposure page', async () => {
+        describeAnswer = customersApi({ routable: false, notRoutableReason: 'not-exposed' });
+        const problem = toolJsonAs<{ detail: string }>(await call('wicket_api_read', { pageId: 30009 }));
+        expect(problem.detail).toContain('not exposed in Wicket');
+        expect(problem.detail).not.toMatch(/allowlist/i);
+    });
+
     test('a non-routable API is refused before any API call, pointing at wicket_query', async () => {
         describeAnswer = customersApi({ routable: false, notRoutableReason: 'routing-off' });
         const res = await call('wicket_api_read', { pageId: 30009 });

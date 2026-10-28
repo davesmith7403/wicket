@@ -74,7 +74,7 @@ contract, the API's own field names and shaping. Wicket's **API Routing** settin
   been installed, upgraded or removed. Without `tableId` / `search` / `group` it returns a summary by
   route prefix. `wicket_describe` of a table also lists its `apiRoutes`.
 - **Governance, fresh.** `wicket_api_read` asks `describe kind:"api"` on every call — never cached —
-  and refuses unless `routable` is true (routing is `Prefer`, and Wicket's exposure allowlist and BC
+  and refuses unless `routable` is true (routing is `Prefer`, and Wicket's exposure list and BC
   permissions let this caller read the source table). Every field it selects, filters on or orders by
   must be one Wicket marks `readable` under the field policy; a computed API field (no table field
   behind it) is never readable. With no `select`, it selects exactly the readable fields, and it
@@ -291,7 +291,7 @@ register (`glRegisterNo`/`itemRegisterNo`, `firstEntryNo`, `lastEntryNo`) or
 write in Business Central undone), so they are allowed on a read-only endpoint, on a connection
 configured `readOnly` (the client reads the verb's flag from capabilities first; one extra call per
 non-preview action on such a connection), and without an idempotency key. They can still return
-data — a PDF, a preview's amounts — that the exposure allowlist and field policy do not govern.
+data — a PDF, a preview's amounts — that the exposure list and field policy do not govern.
 Every other `action` call is refused with `403 read-only`. The posting error text of a failed
 action surfaces as `422 action-failed`.
 
@@ -375,7 +375,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.2+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.3+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -499,7 +499,7 @@ env `default` on a name collision):
 
 `companyId` is **required** on every connection — Wicket's endpoint is company-scoped
 (`companies({companyId})/wicketEndpoint(0)/…`), so there is no companyless route to
-discover it. The optional `companies` array is a client-side allowlist
+discover it. The optional `companies` array lists the connection's permitted companies, a client-side check
 (defense-in-depth, not a security boundary — the real check is BC's per-principal
 company access); when present, the connection's `companyId` must be a member or the
 server refuses to load it.
@@ -739,7 +739,7 @@ normally don't run it by hand except to smoke-test config.
 the tool layer runs behind a real MCP `Client` over the SDK's in-memory transport, so
 zod validation, the handlers and result rendering are all on the path. Coverage in
 brief: connection loading and validation (env, `connections.json`, strict keys, default
-resolution, allowlist, secret ladder), token caching/coalescing/timeouts, the transport
+resolution, permitted companies, secret ladder), token caching/coalescing/timeouts, the transport
 contract (URL, envelope, OData unwrapping, RFC 7807 detection, synthetic problems), the
 `readOnly` guard, per-connection token isolation, retry guidance and the one-shot 401
 retry, the non-blocking device-code sign-in (stubbed credential), `wicket_query_all`

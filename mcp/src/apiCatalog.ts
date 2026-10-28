@@ -301,7 +301,7 @@ export function planApiRead(api: ApiDescription, req: ApiReadRequest): ApiReadPl
                 reason === 'routing-off'
                     ? 'API routing is Off in Wicket Setup, so reads go through the dynamic plane. Use wicket_query on the source table.'
                     : reason === 'not-exposed'
-                      ? `Wicket does not let this caller read table ${api.sourceTableId ?? '?'} (exposure allowlist or BC permissions), so its API cannot be used either.`
+                      ? `Wicket does not let this caller read table ${api.sourceTableId ?? '?'} (the table is not exposed in Wicket, or BC permissions lack it), so its API cannot be used either.`
                       : `This API cannot be pre-checked against Wicket's field policy (${reason}). Use wicket_query on the source table.`,
             suggest: { use: 'wicket_query', ...(api.sourceTableId !== undefined ? { tableId: api.sourceTableId } : {}), reason },
         };
