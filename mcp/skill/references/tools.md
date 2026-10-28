@@ -1,14 +1,14 @@
 # Tool reference
 
-The 23 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
+The 24 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
 
 ## wicket_connections
 
-Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials` or `device_code`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`invoke`/`action` before anything is sent.
+Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials`, `device_code` or `browser`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`invoke`/`action` before anything is sent. When nothing usable is configured, the answer also carries `problem` (`missing`, `invalid` or `dangling-default`), and an entry set aside for a bad value is listed under `rejected` with its reason: offer `/wicket:setup`.
 
 ## wicket_whoami
 
-`{ userSecurityId, userId, company, readOnly, fieldPolicy, strongEtag, unmaskGranted, activeExceptions, serverTime }` — the principal and company the connection resolves to and the endpoint posture. One small call; cheaper than `wicket_capabilities` when identity is all you need. `serverTime` is the watermark to store for an incremental sync. A `device_code` connection answers `401 sign-in-required` with a URL and code until the user has signed in: show them, then retry.
+`{ userSecurityId, userId, company, readOnly, fieldPolicy, strongEtag, unmaskGranted, activeExceptions, serverTime }` — the principal and company the connection resolves to and the endpoint posture. One small call; cheaper than `wicket_capabilities` when identity is all you need. `serverTime` is the watermark to store for an incremental sync. A `device_code` connection answers `401 sign-in-required` with a URL and code until the user has signed in: show them, then retry. A `browser` connection answers the same problem without a code: a sign-in window has opened, so ask the user to finish there, then retry.
 
 ## wicket_capabilities
 
@@ -89,6 +89,10 @@ A BC web-client deep link for one record: `table` (a name such as `"Customer"` o
 ## wicket_skill
 
 This guide, with progressive disclosure: `mode:"toc"` (default) lists every file and section; `mode:"section"` with a section title or a reference file name (`filters`, `errors`, `writes`, `presenting`, `automation`, `tables`, `protocol`, `tools`) returns that text; `mode:"full"` returns everything (large). Local and free.
+
+## wicket_setup
+
+Adds, fixes, re-defaults and removes connections, and works when none is configured. In Claude Code, `/wicket:setup` drives it with questions; elsewhere follow its description. The add path is `locate` (a BC address, email or domain) → `signin` (`browser`, `device_code` or `client_credentials`; call it again while it answers `pending`) → `environments` → `companies` → `save`, which tests the new connection with `whoami`. `status` checks each connection without prompting a sign-in. Confirm with the user before `remove`. A client secret never passes through it: the user stores it in the Keychain themselves.
 
 ## wicket_use
 

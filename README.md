@@ -12,8 +12,8 @@ This repository is the **agent side** of Wicket:
 
 | Folder | What it is |
 |---|---|
-| [`plugin/`](plugin/) | The plugin: the bundled MCP server, the usage skill, and the `/wicket:orient` and `/wicket:inventory` commands |
-| [`mcp/`](mcp/README.md) | The MCP server source (TypeScript on Bun): 23 `wicket_*` tools, multi-connection, OAuth2 service principal or device-code sign-in |
+| [`plugin/`](plugin/) | The plugin: the bundled MCP server, the usage skill, and the `/wicket:setup`, `/wicket:orient` and `/wicket:inventory` commands |
+| [`mcp/`](mcp/README.md) | The MCP server source (TypeScript on Bun): 24 `wicket_*` tools, multi-connection, OAuth2 service principal, browser or device-code sign-in |
 | [`skills/wicket-usage/`](skills/wicket-usage/SKILL.md) | The usage skill: how an agent should orient, filter, write, post and present results |
 | [`docs/`](docs/) | Entra ID setup for the connection, and the single-file edition of the skill |
 
@@ -21,10 +21,11 @@ The repository root is also the plugin's marketplace.
 
 ## Requirements
 
-> **The Wicket Business Central extension is required and is not published yet.** Every `wicket_*`
-> tool calls the Wicket endpoint inside Business Central; without the extension installed in your
-> environment the plugin installs but cannot connect. The extension will be published in its own
-> repository.
+> **The Wicket Business Central extension is required.** Every `wicket_*` tool calls the Wicket
+> endpoint inside Business Central; without the extension installed in your environment the plugin
+> installs but cannot connect. Get it from the
+> [wicket-bc releases](https://github.com/davesmith7403/wicket-bc/releases), and set it up with the
+> [Product Guide](https://davesmith7403.github.io/wicket-bc/).
 
 - Business Central online (BC 26 or later) with the Wicket extension installed
 - An Entra ID app registration (service principal) or a user account with a Wicket permission set —
@@ -38,9 +39,13 @@ The repository root is also the plugin's marketplace.
 /plugin install wicket@wicket
 ```
 
-Then configure a connection (tenant, environment, company, credentials) as described in
-[mcp/README.md](mcp/README.md#connections). Connections and credentials stay on your machine in
-`~/.config/wicket/`; client secrets can live in the system keychain.
+Then run **`/wicket:setup`**. It asks how you sign in (in the browser, with a device code, or as an
+app with a client secret), works out the tenant from a pasted Business Central address or your work
+email, and lets you pick the environment and company from lists: no IDs to look up. It saves the
+connection, tests it, and the tools work at once. Run it again to add another tenant or company, fix a
+connection that fails, or change the default. Connections stay on your machine in `~/.config/wicket/`;
+a client secret goes into the system keychain through a command you run yourself, never through the
+chat. To write the file by hand instead, see [mcp/README.md](mcp/README.md#connections).
 
 Other MCP hosts can run the server directly — see [mcp/README.md](mcp/README.md) for Claude Desktop
 and standalone setup, and for installing the skill without the plugin.

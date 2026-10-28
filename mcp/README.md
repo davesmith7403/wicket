@@ -33,7 +33,8 @@ problem) for the agent.
 | `wicket_cancel` | `cancel` | Cancel one async delivery request by `requestId` (caller-scoped) |
 | `wicket_requests` | `requests` | List your own async delivery requests (`status?`, `top?`) |
 | `wicket_query_all` | `query` (looped) | Convenience: page a `query` to completion, concatenating every page up to `maxPages` / `maxRows` (no `aggregate`, no `deliver`) |
-| `wicket_connections` | — (local) | List the configured connections (name, tenant, environment, company, `authMode`, default, selected) |
+| `wicket_connections` | — (local) | List the configured connections (name, tenant, environment, company, `authMode`, default, selected), plus any load `problem` and `rejected` entries |
+| `wicket_setup` | — (local, Entra, BC admin APIs) | Guided setup: `status` (silent health check), `locate` (tenant from a BC address, email or domain), `signin`, `environments`, `companies`, `save` (writes and tests the connection, live, no restart), `remove`, `setDefault`, `moveAsideBroken`. Driven by `/wicket:setup` in Claude Code |
 | `wicket_use` | — (local) | Switch the session's active connection (caveated; prefer the per-call `connection` override) |
 | `wicket_map` | `capabilities` (for `structureVersion`) | The tenant map: per-connection Markdown notes on solution tables (purpose, business key, joins, gotchas) — `read` / `upsert` / `remove` by `## ` section, structure only, stale when apps change |
 | `wicket_skill` | — (local) | The bundled usage guide (SKILL.md plus reference files), with progressive disclosure: `toc`, one `section` or one whole reference file, or `full` |
@@ -374,7 +375,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.3.0+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.0+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -425,6 +426,18 @@ Requires [Bun](https://bun.sh) ≥ 1.0.
 cd mcp
 bun install
 ```
+
+## Guided setup
+
+In Claude Code with the plugin installed, run **`/wicket:setup`**: it asks how you sign in (browser,
+device code, or an app with a client secret), finds the tenant from a pasted BC address or an
+email, lists the environments and companies to pick from, saves the connection to
+`~/.config/wicket/connections.json` and tests it, all without a GUID typed by hand or a restart. The
+same command fixes a connection that fails, changes the default and removes connections. It drives
+the `wicket_setup` tool, which any MCP host can call directly. The server starts even with no
+connection configured; every tool then answers `503 connection-unavailable` naming `/wicket:setup`.
+
+The rest of this section configures the server by hand.
 
 ## Configure
 
@@ -536,10 +549,16 @@ connections). If omitted it is the env `default`, else the first entry.
 
 ### Load-time validation
 
-The whole file is validated when the server starts — misconfiguration fails **fast
-and loudly** (the error names the file, e.g. `Failed to load
-~/.config/wicket/connections.json: connections.contoso: …`), never at the first
-token fetch:
+The whole file is validated when the server starts, never at the first token fetch, but a
+problem no longer stops the server: an entry that fails a check below is **set aside** with
+its reason (`wicket_connections` and `wicket_setup status` list it under `rejected`, e.g.
+`connections.contoso.keychainSevice: Unrecognized key`) while the other entries load. A file that
+is not valid JSON, no configuration at all, or a `default` naming no usable connection is
+reported as `problem` (`invalid`, `missing`, `dangling-default`); calls then answer `503
+connection-unavailable`. A dangling default never falls back to another connection.
+
+- **`clientId`** is required for `client_credentials`; the delegated modes (`device_code`,
+  `browser`) default it to Wicket's default public client `1950a258-227b-4e31-a9cf-717495945fc2`.
 
 - **Strict keys** — an unknown key on a connection (e.g. a typo'd `keychainSevice`)
   is rejected instead of being silently stripped (which would change which rung of
@@ -558,9 +577,8 @@ token fetch:
   must be an absolute `https://` URL (the bearer token rides on every request). The env
   `default` gets the same checks (`BC_TENANT_ID`, `BC_ENVIRONMENT`, `BC_BASE_URL`), plus
   `BC_ORIGIN` must fit the envelope origin rule (`[A-Za-z0-9._@/+:-]`, ≤ 256 chars).
-- **A broken env `default` is only fatal when it is used** — if `connections.json`
-  defines its own `default` connection (which replaces the env one), a malformed
-  `BC_*` quartet does not block startup.
+- **A broken env `default`** is set aside like a bad file entry, unless `connections.json`
+  defines its own `default` connection (which replaces the env one).
 - **`readOnly`** (optional boolean, default `false`) — see
   [Read-only connections](#read-only-connections).
 - **`unmask`** (optional boolean, default unset) — set `false` to make the connection
@@ -611,7 +629,7 @@ Use `wicket_connections` to list what's configured and see which is default/sele
 
 ### Auth modes
 
-Each connection picks one of two `authMode`s.
+Each connection picks one of three `authMode`s.
 
 **`client_credentials`** (default) — a service principal (app identity). The app's own
 client + secret get a token via `client_credentials`; every call is attributed to the
@@ -651,17 +669,26 @@ public-client `clientId`; omit every secret field.
   `device_code` connection actually fetches a token, so a pure `client_credentials`
   deployment never touches it.
 
-#### Entra prerequisites (`device_code`)
+**`browser`** — the same delegated sign-in as `device_code`, but a browser window opens on the
+machine running the server (MSAL's `InteractiveBrowserCredential`, redirect to `http://localhost`),
+so there is no code to type. Everything else is shared with `device_code`: the non-blocking first
+call (the `401 sign-in-required` problem says a window opened, with no `userCode`), the Keychain-
+persisted token cache and the account record in `~/.config/wicket/auth/<connection>.json`. It needs
+a desktop session; over SSH use `device_code`. For both delegated modes `clientId` is optional and
+defaults to Wicket's default public client `1950a258-227b-4e31-a9cf-717495945fc2`.
+
+#### Entra prerequisites (`device_code`, `browser`)
 
 1. **App registration** (a single multi-tenant public-client app used across customers,
    or one per tenant):
    - **Authentication → Allow public client flows → Yes** (device code is a
-     public-client grant).
+     public-client grant). For `browser`, also add the platform **Mobile and desktop
+     applications** with the redirect URI `http://localhost`.
    - **API permissions → Dynamics 365 Business Central → Delegated →
      `user_impersonation`**, admin-consented in each target tenant. (The server requests the
-     `.default` scope, which resolves to that consented permission.) For your own tenant, a
-     Microsoft first-party public client that already has Business Central consent, such as
-     Azure PowerShell `1950a258-227b-4e31-a9cf-717495945fc2`, also works without a registration.
+     `.default` scope, which resolves to that consented permission.) For your own tenant,
+     Wicket's default public client `1950a258-227b-4e31-a9cf-717495945fc2`, which Business
+     Central already trusts, works without a registration.
 2. In **each customer's BC**, the consultant's (guest) user needs a **Wicket role set**
    (`Wicket - Read` for a read-only engagement, `Wicket - Execute` or `Wicket - Edit` when
    the agent may invoke or write) plus the relevant data permissions. There is **no

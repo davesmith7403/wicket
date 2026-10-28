@@ -116,12 +116,13 @@ const ConnectionEntry = z.object({
     /** Optional allowlist of company GUIDs this connection may target (defense in depth). */
     companies: z.array(z.string()).optional(),
     /**
-     * "client_credentials" (default) uses a service-principal secret; "device_code"
-     * signs the running user in interactively (public client, no secret) and calls BC
-     * with their delegated identity.
+     * "client_credentials" (default) uses a service-principal secret; "device_code" and
+     * "browser" sign the running user in (public client, no secret) and call BC with their
+     * delegated identity — by a code typed at microsoft.com/devicelogin, or in a browser window.
      */
-    authMode: z.enum(['client_credentials', 'device_code']).default('client_credentials'),
-    clientId: z.string().min(1),
+    authMode: z.enum(['client_credentials', 'device_code', 'browser']).default('client_credentials'),
+    /** Required for client_credentials; the delegated modes default to DEFAULT_PUBLIC_CLIENT_ID. */
+    clientId: z.string().min(1).optional(),
     /**
      * device_code only: keep the sign-in across MCP restarts — MSAL's token cache in the OS
      * keychain, the account record in ~/.config/wicket/auth/<name>.json. Default true; false
@@ -160,14 +161,28 @@ const ConnectionEntry = z.object({
  * A resolved connection: the file/env entry plus its name and (for the implicit
  * env `default` only) an optional `origin` override honouring BC_ORIGIN.
  */
-export type ConnectionSpec = z.infer<typeof ConnectionEntry> & {
+export type ConnectionSpec = Omit<z.infer<typeof ConnectionEntry>, 'clientId'> & {
+    clientId: string;
     name: string;
     origin?: string;
 };
 
+/**
+ * The client a delegated connection signs in through when it names none: a Microsoft first-party
+ * public client that Business Central already trusts in every tenant, so no app registration is needed.
+ */
+export const DEFAULT_PUBLIC_CLIENT_ID = '1950a258-227b-4e31-a9cf-717495945fc2';
+
+/** True for the modes that sign a person in (no secret). */
+export function isDelegated(authMode: ConnectionSpec['authMode']): authMode is 'device_code' | 'browser' {
+    return authMode === 'device_code' || authMode === 'browser';
+}
+
+// Entries are validated one by one (ConnectionEntry), so one bad entry is set aside rather than
+// taking every connection down with it.
 const ConnectionsFile = z.object({
     default: z.string().optional(),
-    connections: z.record(ConnectionEntry),
+    connections: z.record(z.unknown()),
 }).strict();
 
 const CONNECTION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -203,10 +218,10 @@ function assertSecretSource(spec: ConnectionSpec): void {
     const hasAnySource =
         hasKeychainPair || Boolean(spec.secretEnv) || Boolean(spec.clientSecret);
 
-    if (spec.authMode === 'device_code') {
+    if (isDelegated(spec.authMode)) {
         if (hasAnySource || spec.keychainService || spec.keychainAccount) {
             process.stderr.write(
-                `wicket-mcp: connection "${spec.name}" uses device_code — its configured ` +
+                `wicket-mcp: connection "${spec.name}" uses ${spec.authMode} — its configured ` +
                     `secret source (keychain/secretEnv/clientSecret) is ignored.\n`,
             );
         }
@@ -225,6 +240,34 @@ function assertSecretSource(spec: ConnectionSpec): void {
                 'configured — set keychainService+keychainAccount, secretEnv, or clientSecret.',
         );
     }
+}
+
+function errorText(err: unknown): string {
+    if (err instanceof z.ZodError) {
+        return err.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');
+    }
+    return err instanceof Error ? err.message : String(err);
+}
+
+/** Validate one connections.json entry. Throws with a message naming the entry's path. */
+export function validateConnectionEntry(name: string, raw: unknown): ConnectionSpec {
+    if (!CONNECTION_NAME_RE.test(name)) {
+        throw new Error(`Connection name "${name}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
+    }
+    const result = ConnectionEntry.safeParse(raw);
+    if (!result.success) {
+        throw new Error(
+            result.error.issues.map((i) => `${['connections', name, ...i.path].join('.')}: ${i.message}`).join('; '),
+        );
+    }
+    const entry = result.data;
+    if (!entry.clientId && !isDelegated(entry.authMode)) {
+        throw new Error(`connections.${name}.clientId: required for client_credentials`);
+    }
+    const spec: ConnectionSpec = { ...entry, clientId: entry.clientId ?? DEFAULT_PUBLIC_CLIENT_ID, name };
+    assertCompanyAllowed(spec);
+    assertSecretSource(spec);
+    return spec;
 }
 
 /** Build + validate the implicit env `default` connection. Throws on a malformed variable. */
@@ -267,66 +310,107 @@ function envDefaultSpec(tenantId: string, environment: string, companyId: string
 // Registry
 // ---------------------------------------------------------------------------
 
+/** Why the registry has no usable default: nothing configured, an unreadable file, or a default naming nothing. */
+export interface RegistryProblem {
+    kind: 'missing' | 'invalid' | 'dangling-default';
+    file: string;
+    message: string;
+}
+
+/** A configured connection that failed validation: set aside, never reachable. */
+export interface RejectedConnection {
+    name: string;
+    source: 'file' | 'env';
+    message: string;
+}
+
+const SETUP_HINT = 'Run /wicket:setup (or call the wicket_setup tool).';
+
+/** No connection to route a call to: nothing configured, a rejected entry, or no default. */
+export class ConnectionUnavailableError extends Error {
+    constructor(reason: string) {
+        super(`${reason} ${SETUP_HINT}`);
+        this.name = 'ConnectionUnavailableError';
+    }
+}
+
 export class ConnectionRegistry {
-    private readonly specs = new Map<string, ConnectionSpec>();
+    private specs = new Map<string, ConnectionSpec>();
     private defaultName: string | undefined;
     /** Sticky session selection, set by the wicket_use tool. */
     private selected: string | undefined;
+    /** Set when there is nothing to fall back on; reported by wicket_connections and setup. */
+    problem: RegistryProblem | undefined;
+    rejected: RejectedConnection[] = [];
+    /** Names whose loaded spec came from the BC_* variables, which setup cannot edit. */
+    private fromEnv = new Set<string>();
 
+    /**
+     * Never throws: a missing or unreadable file, or a bad entry, is recorded (problem / rejected)
+     * and the server starts with what did load, so setup can repair it from the chat.
+     */
     static load(): ConnectionRegistry {
         const reg = new ConnectionRegistry();
+        reg.reload();
+        return reg;
+    }
+
+    /** Re-read the env vars and the file in place. The session selection survives if it still loads. */
+    reload(): void {
+        const specs = new Map<string, ConnectionSpec>();
+        const rejected: RejectedConnection[] = [];
+        let defaultName: string | undefined;
+        let problem: RegistryProblem | undefined;
+        const file = connectionsFile();
 
         // 1. Implicit "default" from env vars (back-compat with single-connection setups).
-        // A malformed env default is NOT fatal yet: connections.json may define its own
-        // "default" that replaces it (below). The error is raised only if nothing does.
-        let envError: Error | undefined;
+        // A malformed env default is set aside only if connections.json does not define its
+        // own "default" (below).
+        let envRejection: RejectedConnection | undefined;
+        let envLoaded = false;
         const t = process.env.BC_TENANT_ID?.trim();
         const e = process.env.BC_ENVIRONMENT?.trim();
         const co = process.env.BC_COMPANY_ID?.trim();
         const c = process.env.BC_CLIENT_ID?.trim();
         if (t && e && co && c) {
             try {
-                reg.specs.set('default', envDefaultSpec(t, e, co, c));
+                specs.set('default', envDefaultSpec(t, e, co, c));
+                defaultName = 'default';
+                envLoaded = true;
             } catch (err) {
-                envError = err instanceof Error ? err : new Error(String(err));
+                envRejection = { name: 'default', source: 'env', message: errorText(err) };
             }
-            reg.defaultName = 'default';
         }
 
         // 2. connections.json (overrides env on name collision).
-        const file = connectionsFile();
+        let declaredDefault: string | undefined;
         if (existsSync(file)) {
-            // Wrap parse failures so the error names the FILE — a bare zod/JSON error
-            // gives the operator nothing to open. Zod issues keep their paths
-            // (e.g. connections.contoso: Unrecognized key(s) in object: 'keychainSevice').
-            let parsed: z.infer<typeof ConnectionsFile>;
+            let parsed: z.infer<typeof ConnectionsFile> | undefined;
             try {
                 parsed = ConnectionsFile.parse(JSON.parse(readFileSync(file, 'utf8')));
             } catch (err) {
-                const cause =
-                    err instanceof z.ZodError
-                        ? err.issues
-                              .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
-                              .join('; ')
-                        : err instanceof Error
-                          ? err.message
-                          : String(err);
-                throw new Error(`Failed to load ${file}: ${cause}`);
+                // A JSON syntax error quotes the text around it, which could be an inline secret.
+                const reason = err instanceof SyntaxError ? 'it is not valid JSON' : errorText(err);
+                problem = { kind: 'invalid', file, message: `Failed to load ${file}: ${reason}` };
             }
-            for (const [name, entry] of Object.entries(parsed.connections)) {
-                if (!CONNECTION_NAME_RE.test(name)) {
-                    throw new Error(
-                        `Connection name "${name}" is invalid (use [A-Za-z0-9._-], <=64 chars).`,
-                    );
+            let inlineSecret = false;
+            for (const [name, raw] of Object.entries(parsed?.connections ?? {})) {
+                try {
+                    const spec = validateConnectionEntry(name, raw);
+                    specs.set(name, spec);
+                    inlineSecret ||= Boolean(spec.clientSecret);
+                    if (name === 'default') {
+                        envRejection = undefined;
+                        envLoaded = false;
+                    }
+                } catch (err) {
+                    specs.delete(name);
+                    rejected.push({ name, source: 'file', message: errorText(err) });
                 }
-                const spec: ConnectionSpec = { ...entry, name };
-                assertCompanyAllowed(spec);
-                assertSecretSource(spec);
-                reg.specs.set(name, spec);
             }
             // Best-effort hygiene: a connections.json that carries an INLINE secret
             // should not be readable by group/other. Warn once; never fail the load.
-            if (Object.values(parsed.connections).some((c) => c.clientSecret)) {
+            if (inlineSecret) {
                 try {
                     if (statSync(file).mode & 0o077) {
                         process.stderr.write(
@@ -338,49 +422,77 @@ export class ConnectionRegistry {
                     /* best-effort only */
                 }
             }
-            // An explicitly declared default MUST name a loaded connection — otherwise
-            // every non-overridden call (including writes) would silently target
-            // whichever connection happens to be first. Fail fast, like the name check.
-            if (parsed.default !== undefined) {
-                if (!reg.specs.has(parsed.default)) {
-                    throw new Error(
-                        `connections.json declares default "${parsed.default}", which is not a ` +
-                            `configured connection. Available: ${[...reg.specs.keys()].join(', ')}.`,
-                    );
-                }
-                reg.defaultName = parsed.default;
+            declaredDefault = parsed?.default;
+        }
+        if (envRejection) rejected.unshift(envRejection);
+
+        // An explicitly declared default MUST name a loaded connection. It never falls back to
+        // another one: every call without an override (writes included) would land on a
+        // connection nobody chose.
+        if (declaredDefault !== undefined) {
+            defaultName = specs.has(declaredDefault) ? declaredDefault : undefined;
+            if (!defaultName && !problem) {
+                problem = {
+                    kind: 'dangling-default',
+                    file,
+                    message:
+                        `connections.json declares default "${declaredDefault}", which is not a ` +
+                        `usable connection. Available: ${[...specs.keys()].join(', ') || '(none)'}.`,
+                };
             }
+        } else if (!defaultName) {
+            // Implicit fallback ONLY when no default was declared anywhere.
+            defaultName = specs.keys().next().value;
+        }
+        if (specs.size === 0 && rejected.length === 0 && !problem) {
+            problem = { kind: 'missing', file, message: `No Business Central connection is configured (${file}).` };
         }
 
-        // The env default was malformed and no file entry named "default" replaced it.
-        if (envError && !reg.specs.has('default')) throw envError;
-
-        if (reg.specs.size === 0) {
-            throw new Error(
-                'No Wicket connections configured. Either set BC_TENANT_ID/BC_ENVIRONMENT/' +
-                    'BC_COMPANY_ID/BC_CLIENT_ID/BC_CLIENT_SECRET, or create ' +
-                    '~/.config/wicket/connections.json.',
-            );
+        // Keep the previous object for an entry that did not change: the client pool keys on it, so
+        // its client, cached token and any sign-in in progress survive an unrelated save.
+        for (const [name, spec] of specs) {
+            const previous = this.specs.get(name);
+            if (previous && JSON.stringify(previous) === JSON.stringify(spec)) specs.set(name, previous);
         }
-        // Implicit fallback ONLY when no default was declared anywhere (no env-implicit
-        // "default", no file `default`): fall back to the first connection loaded.
-        if (!reg.defaultName) {
-            reg.defaultName = reg.specs.keys().next().value;
-        }
-        return reg;
+        this.specs = specs;
+        this.fromEnv = new Set(envLoaded ? ['default'] : []);
+        this.rejected = rejected;
+        this.problem = problem;
+        this.defaultName = defaultName;
+        if (this.selected !== undefined && !specs.has(this.selected)) this.selected = undefined;
     }
 
     /** Resolution ladder: per-call override -> session selection -> default. */
     resolve(override?: string): ConnectionSpec {
-        const name = override ?? this.selected ?? this.defaultName!;
+        const name = override ?? this.selected ?? this.defaultName;
+        if (name === undefined) throw new ConnectionUnavailableError(this.unavailableReason());
         const spec = this.specs.get(name);
         if (!spec) {
+            const rejection = this.rejected.find((r) => r.name === name);
+            if (rejection) {
+                throw new ConnectionUnavailableError(`Connection "${name}" is set aside: ${rejection.message}.`);
+            }
             throw new Error(
                 `Unknown connection "${name}". Available: ${[...this.specs.keys()].join(', ')}. ` +
                     'Use wicket_connections to list them.',
             );
         }
         return spec;
+    }
+
+    /** Where a loaded connection came from; undefined when no connection has that name. */
+    sourceOf(name: string): 'file' | 'env' | undefined {
+        if (!this.specs.has(name)) return undefined;
+        return this.fromEnv.has(name) ? 'env' : 'file';
+    }
+
+    private unavailableReason(): string {
+        if (this.problem?.kind === 'missing') return 'No Business Central connection is configured.';
+        if (this.problem) return `${this.problem.message}`;
+        if (this.specs.size === 0) {
+            return `No usable connection: ${this.rejected.map((r) => `"${r.name}" (${r.message})`).join('; ')}.`;
+        }
+        return 'No default connection: pass `connection` on the call.';
     }
 
     select(name: string): ConnectionSpec {
@@ -394,9 +506,9 @@ export class ConnectionRegistry {
         return spec;
     }
 
-    current(): { name: string; isSessionSelection: boolean } {
+    current(): { name: string | undefined; isSessionSelection: boolean } {
         return {
-            name: this.selected ?? this.defaultName!,
+            name: this.selected ?? this.defaultName,
             isSessionSelection: this.selected !== undefined,
         };
     }
@@ -586,37 +698,46 @@ export class AppTokenProvider implements TokenSource {
     }
 }
 
+/** What the person must do to sign in: enter a code at a URL, or finish in the browser window that opened. */
+export type SignInPrompt =
+    | { kind: 'device_code'; verificationUri: string; userCode: string }
+    | { kind: 'browser' };
+
 /**
- * Thrown by UserTokenProvider when the device-code sign-in is waiting on the human. Carries
- * the verification URL + user code so the MCP layer can hand them to the agent as a problem.
+ * Thrown by UserTokenProvider when a delegated sign-in is waiting on the human. Carries the prompt
+ * so the MCP layer can hand it to the agent as a problem.
  */
-export class DeviceCodeSignInRequiredError extends Error {
+export class SignInRequiredError extends Error {
     constructor(
         readonly connection: string,
-        readonly verificationUri: string,
-        readonly userCode: string,
+        readonly prompt: SignInPrompt,
     ) {
         super(
-            `Connection "${connection}": sign in at ${verificationUri} with code ${userCode}, ` +
-                'then retry the call.',
+            prompt.kind === 'device_code'
+                ? `Connection "${connection}": sign in at ${prompt.verificationUri} with code ${prompt.userCode}, ` +
+                      'then retry the call.'
+                : `Connection "${connection}": finish signing in in the browser window that opened, then retry the call.`,
         );
-        this.name = 'DeviceCodeSignInRequiredError';
+        this.name = 'SignInRequiredError';
     }
 }
 
-/** The slice of DeviceCodeCredential the provider uses — a seam for tests. */
+/** A silent-only credential found that the person must sign in again (no prompt was started). */
+export class SignInNeededError extends Error {
+    constructor(connection: string) {
+        super(`Connection "${connection}": the saved sign-in is missing or expired; sign in again.`);
+        this.name = 'SignInNeededError';
+    }
+}
+
+/** The slice of a delegated credential the provider uses — a seam for tests. */
 export interface DeviceCodeCredentialLike {
     getToken(scope: string): Promise<{ token: string } | null>;
 }
 
-export interface DeviceCodePrompt {
-    verificationUri: string;
-    userCode: string;
-}
-
 export interface UserTokenProviderOptions {
-    /** Build the credential; the default lazily imports @azure/identity's DeviceCodeCredential. */
-    createCredential?: (onPrompt: (info: DeviceCodePrompt) => void) => Promise<DeviceCodeCredentialLike>;
+    /** Build the credential; the default lazily imports @azure/identity (see createDelegatedCredential). */
+    createCredential?: (onPrompt: (info: SignInPrompt) => void) => Promise<DeviceCodeCredentialLike>;
     /** How long one getToken waits for a token (or the sign-in prompt) before returning. */
     waitMs?: number;
 }
@@ -624,27 +745,27 @@ export interface UserTokenProviderOptions {
 /** Default wait: long enough for MSAL to deliver the prompt or a cached/refreshed token. */
 const DEVICE_CODE_WAIT_MS = 10_000;
 
-/** One device-code acquisition, shared by every getToken while it runs. */
+/** One sign-in acquisition, shared by every getToken while it runs. */
 interface DeviceCodeFlow {
     token: Promise<string>;
-    /** Resolves when the prompt (URL + code) arrives; never rejects. */
+    /** Resolves when the prompt (URL + code, or the browser opening) arrives; never rejects. */
     prompted: Promise<void>;
-    prompt: DeviceCodePrompt | undefined;
+    prompt: SignInPrompt | undefined;
 }
 
 /**
- * device_code — delegated user identity via @azure/identity's DeviceCodeCredential.
- * No client secret (public-client flow): tenantId + clientId only.
+ * device_code and browser — delegated user identity via @azure/identity's DeviceCodeCredential or
+ * InteractiveBrowserCredential. No client secret (public-client flow): tenantId + clientId only.
  *
  * The @azure/identity package is imported LAZILY (dynamic import on the first token
  * fetch) so a client_credentials-only deployment never loads it. A tool call NEVER blocks on
  * the human: getToken waits at most `waitMs` — if a token arrives (MSAL cache, or the user
  * already signed in) it is returned; if the flow is instead waiting on sign-in, getToken
- * throws DeviceCodeSignInRequiredError carrying the URL + code (also written to STDERR, since
+ * throws SignInRequiredError carrying the prompt (also written to STDERR, since
  * stdout is the MCP protocol channel). The flow keeps polling in the background, so the next
  * call picks up the token once the user has signed in. MSAL keeps the token cached and
  * refreshes it silently; with persistTokenCache (the default) the cache and account record
- * outlive the process (see defaultDeviceCodeCredential), otherwise a restart means signing in
+ * outlive the process (see createDelegatedCredential), otherwise a restart means signing in
  * again.
  */
 export class UserTokenProvider implements TokenSource {
@@ -657,7 +778,7 @@ export class UserTokenProvider implements TokenSource {
      */
     private unreported: Error | null = null;
     /** Where the credential's prompt callback reports to — the flow currently running. */
-    private onPrompt: (info: DeviceCodePrompt) => void = () => {};
+    private onPrompt: (info: SignInPrompt) => void = () => {};
     private readonly waitMs: number;
 
     constructor(
@@ -667,6 +788,10 @@ export class UserTokenProvider implements TokenSource {
         this.waitMs = options.waitMs ?? DEVICE_CODE_WAIT_MS;
     }
 
+    private get label(): string {
+        return this.spec.authMode === 'browser' ? 'browser' : 'device-code';
+    }
+
     async getToken(): Promise<string> {
         // Coalesce: every caller shares the one in-flight flow (two parallel FIRST calls would
         // otherwise each trigger a sign-in prompt). Once signed in, MSAL's in-memory cache
@@ -674,7 +799,7 @@ export class UserTokenProvider implements TokenSource {
         if (!this.flow && this.unreported) {
             const failure = this.unreported;
             this.unreported = null;
-            throw new Error(`Connection "${this.spec.name}": device-code sign-in failed: ${failure.message}`, {
+            throw new Error(`Connection "${this.spec.name}": ${this.label} sign-in failed: ${failure.message}`, {
                 cause: failure,
             });
         }
@@ -699,11 +824,9 @@ export class UserTokenProvider implements TokenSource {
         } finally {
             clearTimeout(timer);
         }
-        if (flow.prompt) {
-            throw new DeviceCodeSignInRequiredError(this.spec.name, flow.prompt.verificationUri, flow.prompt.userCode);
-        }
+        if (flow.prompt) throw new SignInRequiredError(this.spec.name, flow.prompt);
         throw new Error(
-            `Connection "${this.spec.name}": device-code sign-in did not start within ` +
+            `Connection "${this.spec.name}": ${this.label} sign-in did not start within ` +
                 `${this.waitMs / 1000}s (no token and no sign-in prompt yet). It keeps running in ` +
                 'the background — retry the call shortly.',
         );
@@ -721,7 +844,9 @@ export class UserTokenProvider implements TokenSource {
         this.onPrompt = (info) => {
             flow.prompt = info;
             process.stderr.write(
-                `\n[wicket:${this.spec.name}] Sign in: ${info.verificationUri} code: ${info.userCode}\n\n`,
+                info.kind === 'device_code'
+                    ? `\n[wicket:${this.spec.name}] Sign in: ${info.verificationUri} code: ${info.userCode}\n\n`
+                    : `\n[wicket:${this.spec.name}] Sign in: a browser window opened — finish signing in there.\n\n`,
             );
             signalPrompt();
         };
@@ -744,49 +869,88 @@ export class UserTokenProvider implements TokenSource {
 
     private async acquire(): Promise<string> {
         if (!this.credential) {
-            const create = this.options.createCredential ?? defaultDeviceCodeCredential(this.spec);
+            const create =
+                this.options.createCredential ??
+                ((onPrompt) => createDelegatedCredential(this.spec as DelegatedTarget, onPrompt));
             this.credential = await create((info) => this.onPrompt(info));
         }
         const token = await this.credential.getToken(DELEGATED_SCOPE);
         if (!token) {
             throw new Error(
-                `Connection "${this.spec.name}": device-code auth returned no token.`,
+                `Connection "${this.spec.name}": ${this.label} auth returned no token.`,
             );
         }
         return token.token;
     }
 }
 
-function defaultDeviceCodeCredential(
-    spec: ConnectionSpec,
-): (onPrompt: (info: DeviceCodePrompt) => void) => Promise<DeviceCodeCredentialLike> {
-    return async (onPrompt) => {
-        const identity = await import('@azure/identity');
-        const persist = spec.persistTokenCache && (await enableTokenCachePersistence(identity.useIdentityPlugin));
-        const recordFile = authRecordPath(spec.name);
-        let record = persist ? readAuthRecord(recordFile, spec, identity.deserializeAuthenticationRecord) : undefined;
-        const credential = new identity.DeviceCodeCredential({
-            tenantId: spec.tenantId,
-            clientId: spec.clientId,
-            userPromptCallback: (info) => onPrompt({ verificationUri: info.verificationUri, userCode: info.userCode }),
-            ...(persist ? { tokenCachePersistenceOptions: { enabled: true, name: TOKEN_CACHE_NAME } } : {}),
-            ...(record ? { authenticationRecord: record } : {}),
-        });
-        if (!persist) return credential;
-        return {
-            async getToken(scope: string) {
-                // Without a record the persisted cache cannot be matched to an account, so the
-                // first sign-in goes through authenticate(), whose record is saved for later starts.
-                if (!record) {
-                    const fresh = await credential.authenticate(scope);
-                    if (fresh) {
-                        record = fresh;
-                        writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
-                    }
+/** What a delegated credential needs: a connection, or the setup session before it has a name. */
+export interface DelegatedTarget {
+    name: string;
+    tenantId: string;
+    clientId: string;
+    authMode: 'browser' | 'device_code';
+    persistTokenCache: boolean;
+}
+
+export interface DelegatedCredential extends DeviceCodeCredentialLike {
+    /** The signed-in account, serialized for authRecordPath — undefined until someone signed in. */
+    authenticationRecord(): string | undefined;
+}
+
+type IdentityModule = typeof import('@azure/identity');
+
+/**
+ * A delegated credential that never signs in behind the caller's back: getToken first tries the
+ * cache silently (the saved account record + MSAL's cache); only when that needs a person does it
+ * report the prompt and sign in — device code (URL + code through onPrompt) or a browser window.
+ * `silentOnly` stops there with SignInNeededError instead, for health checks. With persistence
+ * the account record is saved to authRecordPath(target.name), so the next start is silent.
+ */
+export async function createDelegatedCredential(
+    target: DelegatedTarget,
+    onPrompt: (info: SignInPrompt) => void,
+    opts: { silentOnly?: boolean; identity?: IdentityModule } = {},
+): Promise<DelegatedCredential> {
+    const identity = opts.identity ?? (await import('@azure/identity'));
+    const persist = target.persistTokenCache && (await enableTokenCachePersistence(identity.useIdentityPlugin));
+    const recordFile = authRecordPath(target.name);
+    let record = persist ? readAuthRecord(recordFile, target, identity.deserializeAuthenticationRecord) : undefined;
+    const common = {
+        tenantId: target.tenantId,
+        clientId: target.clientId,
+        disableAutomaticAuthentication: true,
+        ...(persist ? { tokenCachePersistenceOptions: { enabled: true, name: TOKEN_CACHE_NAME } } : {}),
+        ...(record ? { authenticationRecord: record } : {}),
+    };
+    const credential =
+        target.authMode === 'browser'
+            ? new identity.InteractiveBrowserCredential({ ...common, redirectUri: 'http://localhost' })
+            : new identity.DeviceCodeCredential({
+                  ...common,
+                  userPromptCallback: (info) =>
+                      onPrompt({ kind: 'device_code', verificationUri: info.verificationUri, userCode: info.userCode }),
+              });
+    const needsPerson = (e: unknown) => e instanceof Error && e.name === 'AuthenticationRequiredError';
+    return {
+        async getToken(scope: string) {
+            if (record) {
+                try {
+                    return await credential.getToken(scope);
+                } catch (e) {
+                    if (!needsPerson(e)) throw e;
                 }
-                return credential.getToken(scope);
-            },
-        };
+            }
+            if (opts.silentOnly) throw new SignInNeededError(target.name);
+            if (target.authMode === 'browser') onPrompt({ kind: 'browser' });
+            const fresh = await credential.authenticate(scope);
+            if (fresh) {
+                record = fresh;
+                if (persist) writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
+            }
+            return credential.getToken(scope);
+        },
+        authenticationRecord: () => (record ? identity.serializeAuthenticationRecord(record) : undefined),
     };
 }
 
@@ -826,7 +990,7 @@ function enableTokenCachePersistence(useIdentityPlugin: (plugin: never) => void)
  */
 function readAuthRecord<R extends { tenantId: string; clientId: string }>(
     file: string,
-    spec: ConnectionSpec,
+    spec: { tenantId: string; clientId: string },
     deserialize: (text: string) => R,
 ): R | undefined {
     if (!existsSync(file)) return undefined;
@@ -838,7 +1002,7 @@ function readAuthRecord<R extends { tenantId: string; clientId: string }>(
     }
 }
 
-function writeAuthRecord(file: string, text: string): void {
+export function writeAuthRecord(file: string, text: string): void {
     try {
         mkdirSync(join(file, '..'), { recursive: true, mode: 0o700 });
         writeFileSync(file, text, { mode: 0o600 });
@@ -855,7 +1019,7 @@ function writeAuthRecord(file: string, text: string): void {
  * (client_credentials). device_code carries no secret, so it never calls resolveSecret.
  */
 export function makeTokenSource(spec: ConnectionSpec): TokenSource {
-    return spec.authMode === 'device_code'
+    return isDelegated(spec.authMode)
         ? new UserTokenProvider(spec)
         : new AppTokenProvider(spec);
 }

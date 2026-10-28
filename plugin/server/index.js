@@ -29543,6 +29543,7 @@ var init_esm9 = __esm(() => {
 
 // src/index.ts
 import { randomUUID as randomUUID4 } from "crypto";
+import { rmSync as rmSync3 } from "fs";
 
 // node_modules/zod/v3/external.js
 var exports_external = {};
@@ -42559,8 +42560,8 @@ var ConnectionEntry = exports_external.object({
   environment: exports_external.string().regex(ENVIRONMENT_RE, ENVIRONMENT_MSG),
   companyId: exports_external.string().regex(GUID_RE, "must be a brace-less GUID (it is interpolated into the request URL)"),
   companies: exports_external.array(exports_external.string()).optional(),
-  authMode: exports_external.enum(["client_credentials", "device_code"]).default("client_credentials"),
-  clientId: exports_external.string().min(1),
+  authMode: exports_external.enum(["client_credentials", "device_code", "browser"]).default("client_credentials"),
+  clientId: exports_external.string().min(1).optional(),
   persistTokenCache: exports_external.boolean().default(true),
   clientSecret: exports_external.string().optional(),
   secretEnv: exports_external.string().optional(),
@@ -42571,9 +42572,13 @@ var ConnectionEntry = exports_external.object({
   unmask: exports_external.boolean().optional(),
   description: exports_external.string().optional()
 }).strict();
+var DEFAULT_PUBLIC_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2";
+function isDelegated(authMode) {
+  return authMode === "device_code" || authMode === "browser";
+}
 var ConnectionsFile = exports_external.object({
   default: exports_external.string().optional(),
-  connections: exports_external.record(ConnectionEntry)
+  connections: exports_external.record(exports_external.unknown())
 }).strict();
 var CONNECTION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 function assertCompanyAllowed(spec) {
@@ -42587,9 +42592,9 @@ function assertCompanyAllowed(spec) {
 function assertSecretSource(spec) {
   const hasKeychainPair = Boolean(spec.keychainService && spec.keychainAccount);
   const hasAnySource = hasKeychainPair || Boolean(spec.secretEnv) || Boolean(spec.clientSecret);
-  if (spec.authMode === "device_code") {
+  if (isDelegated(spec.authMode)) {
     if (hasAnySource || spec.keychainService || spec.keychainAccount) {
-      process.stderr.write(`wicket-mcp: connection "${spec.name}" uses device_code \u2014 its configured ` + `secret source (keychain/secretEnv/clientSecret) is ignored.
+      process.stderr.write(`wicket-mcp: connection "${spec.name}" uses ${spec.authMode} \u2014 its configured ` + `secret source (keychain/secretEnv/clientSecret) is ignored.
 `);
     }
     return;
@@ -42600,6 +42605,29 @@ function assertSecretSource(spec) {
   if (!hasAnySource) {
     throw new Error(`Connection "${spec.name}": authMode client_credentials but no secret source ` + "configured \u2014 set keychainService+keychainAccount, secretEnv, or clientSecret.");
   }
+}
+function errorText(err) {
+  if (err instanceof exports_external.ZodError) {
+    return err.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+function validateConnectionEntry(name4, raw) {
+  if (!CONNECTION_NAME_RE.test(name4)) {
+    throw new Error(`Connection name "${name4}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
+  }
+  const result = ConnectionEntry.safeParse(raw);
+  if (!result.success) {
+    throw new Error(result.error.issues.map((i) => `${["connections", name4, ...i.path].join(".")}: ${i.message}`).join("; "));
+  }
+  const entry = result.data;
+  if (!entry.clientId && !isDelegated(entry.authMode)) {
+    throw new Error(`connections.${name4}.clientId: required for client_credentials`);
+  }
+  const spec = { ...entry, clientId: entry.clientId ?? DEFAULT_PUBLIC_CLIENT_ID, name: name4 };
+  assertCompanyAllowed(spec);
+  assertSecretSource(spec);
+  return spec;
 }
 function envDefaultSpec(tenantId, environment, companyId, clientId) {
   const bad = (variable, value, why) => new Error(`Connection "default" (from env): ${variable} "${value}" ${why}.`);
@@ -42634,45 +42662,73 @@ function envDefaultSpec(tenantId, environment, companyId, clientId) {
   assertSecretSource(spec);
   return spec;
 }
+var SETUP_HINT = "Run /wicket:setup (or call the wicket_setup tool).";
+
+class ConnectionUnavailableError extends Error {
+  constructor(reason) {
+    super(`${reason} ${SETUP_HINT}`);
+    this.name = "ConnectionUnavailableError";
+  }
+}
 
 class ConnectionRegistry {
   specs = new Map;
   defaultName;
   selected;
+  problem;
+  rejected = [];
+  fromEnv = new Set;
   static load() {
     const reg = new ConnectionRegistry;
-    let envError;
+    reg.reload();
+    return reg;
+  }
+  reload() {
+    const specs = new Map;
+    const rejected = [];
+    let defaultName;
+    let problem;
+    const file = connectionsFile();
+    let envRejection;
+    let envLoaded = false;
     const t = process.env.BC_TENANT_ID?.trim();
     const e = process.env.BC_ENVIRONMENT?.trim();
     const co = process.env.BC_COMPANY_ID?.trim();
     const c = process.env.BC_CLIENT_ID?.trim();
     if (t && e && co && c) {
       try {
-        reg.specs.set("default", envDefaultSpec(t, e, co, c));
+        specs.set("default", envDefaultSpec(t, e, co, c));
+        defaultName = "default";
+        envLoaded = true;
       } catch (err) {
-        envError = err instanceof Error ? err : new Error(String(err));
+        envRejection = { name: "default", source: "env", message: errorText(err) };
       }
-      reg.defaultName = "default";
     }
-    const file = connectionsFile();
+    let declaredDefault;
     if (existsSync(file)) {
       let parsed;
       try {
         parsed = ConnectionsFile.parse(JSON.parse(readFileSync2(file, "utf8")));
       } catch (err) {
-        const cause = err instanceof exports_external.ZodError ? err.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ") : err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to load ${file}: ${cause}`);
+        const reason = err instanceof SyntaxError ? "it is not valid JSON" : errorText(err);
+        problem = { kind: "invalid", file, message: `Failed to load ${file}: ${reason}` };
       }
-      for (const [name4, entry] of Object.entries(parsed.connections)) {
-        if (!CONNECTION_NAME_RE.test(name4)) {
-          throw new Error(`Connection name "${name4}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
+      let inlineSecret = false;
+      for (const [name4, raw] of Object.entries(parsed?.connections ?? {})) {
+        try {
+          const spec = validateConnectionEntry(name4, raw);
+          specs.set(name4, spec);
+          inlineSecret ||= Boolean(spec.clientSecret);
+          if (name4 === "default") {
+            envRejection = undefined;
+            envLoaded = false;
+          }
+        } catch (err) {
+          specs.delete(name4);
+          rejected.push({ name: name4, source: "file", message: errorText(err) });
         }
-        const spec = { ...entry, name: name4 };
-        assertCompanyAllowed(spec);
-        assertSecretSource(spec);
-        reg.specs.set(name4, spec);
       }
-      if (Object.values(parsed.connections).some((c2) => c2.clientSecret)) {
+      if (inlineSecret) {
         try {
           if (statSync2(file).mode & 63) {
             process.stderr.write(`wicket-mcp: ${file} contains an inline clientSecret and is ` + `group/other-readable \u2014 consider: chmod 600 ${file}
@@ -42680,30 +42736,66 @@ class ConnectionRegistry {
           }
         } catch {}
       }
-      if (parsed.default !== undefined) {
-        if (!reg.specs.has(parsed.default)) {
-          throw new Error(`connections.json declares default "${parsed.default}", which is not a ` + `configured connection. Available: ${[...reg.specs.keys()].join(", ")}.`);
-        }
-        reg.defaultName = parsed.default;
+      declaredDefault = parsed?.default;
+    }
+    if (envRejection)
+      rejected.unshift(envRejection);
+    if (declaredDefault !== undefined) {
+      defaultName = specs.has(declaredDefault) ? declaredDefault : undefined;
+      if (!defaultName && !problem) {
+        problem = {
+          kind: "dangling-default",
+          file,
+          message: `connections.json declares default "${declaredDefault}", which is not a ` + `usable connection. Available: ${[...specs.keys()].join(", ") || "(none)"}.`
+        };
       }
+    } else if (!defaultName) {
+      defaultName = specs.keys().next().value;
     }
-    if (envError && !reg.specs.has("default"))
-      throw envError;
-    if (reg.specs.size === 0) {
-      throw new Error("No Wicket connections configured. Either set BC_TENANT_ID/BC_ENVIRONMENT/" + "BC_COMPANY_ID/BC_CLIENT_ID/BC_CLIENT_SECRET, or create " + "~/.config/wicket/connections.json.");
+    if (specs.size === 0 && rejected.length === 0 && !problem) {
+      problem = { kind: "missing", file, message: `No Business Central connection is configured (${file}).` };
     }
-    if (!reg.defaultName) {
-      reg.defaultName = reg.specs.keys().next().value;
+    for (const [name4, spec] of specs) {
+      const previous = this.specs.get(name4);
+      if (previous && JSON.stringify(previous) === JSON.stringify(spec))
+        specs.set(name4, previous);
     }
-    return reg;
+    this.specs = specs;
+    this.fromEnv = new Set(envLoaded ? ["default"] : []);
+    this.rejected = rejected;
+    this.problem = problem;
+    this.defaultName = defaultName;
+    if (this.selected !== undefined && !specs.has(this.selected))
+      this.selected = undefined;
   }
   resolve(override) {
     const name4 = override ?? this.selected ?? this.defaultName;
+    if (name4 === undefined)
+      throw new ConnectionUnavailableError(this.unavailableReason());
     const spec = this.specs.get(name4);
     if (!spec) {
+      const rejection = this.rejected.find((r) => r.name === name4);
+      if (rejection) {
+        throw new ConnectionUnavailableError(`Connection "${name4}" is set aside: ${rejection.message}.`);
+      }
       throw new Error(`Unknown connection "${name4}". Available: ${[...this.specs.keys()].join(", ")}. ` + "Use wicket_connections to list them.");
     }
     return spec;
+  }
+  sourceOf(name4) {
+    if (!this.specs.has(name4))
+      return;
+    return this.fromEnv.has(name4) ? "env" : "file";
+  }
+  unavailableReason() {
+    if (this.problem?.kind === "missing")
+      return "No Business Central connection is configured.";
+    if (this.problem)
+      return `${this.problem.message}`;
+    if (this.specs.size === 0) {
+      return `No usable connection: ${this.rejected.map((r) => `"${r.name}" (${r.message})`).join("; ")}.`;
+    }
+    return "No default connection: pass `connection` on the call.";
   }
   select(name4) {
     const spec = this.specs.get(name4);
@@ -42830,16 +42922,21 @@ class AppTokenProvider {
   }
 }
 
-class DeviceCodeSignInRequiredError extends Error {
+class SignInRequiredError extends Error {
   connection;
-  verificationUri;
-  userCode;
-  constructor(connection, verificationUri, userCode) {
-    super(`Connection "${connection}": sign in at ${verificationUri} with code ${userCode}, ` + "then retry the call.");
+  prompt;
+  constructor(connection, prompt) {
+    super(prompt.kind === "device_code" ? `Connection "${connection}": sign in at ${prompt.verificationUri} with code ${prompt.userCode}, ` + "then retry the call." : `Connection "${connection}": finish signing in in the browser window that opened, then retry the call.`);
     this.connection = connection;
-    this.verificationUri = verificationUri;
-    this.userCode = userCode;
-    this.name = "DeviceCodeSignInRequiredError";
+    this.prompt = prompt;
+    this.name = "SignInRequiredError";
+  }
+}
+
+class SignInNeededError extends Error {
+  constructor(connection) {
+    super(`Connection "${connection}": the saved sign-in is missing or expired; sign in again.`);
+    this.name = "SignInNeededError";
   }
 }
 var DEVICE_CODE_WAIT_MS = 1e4;
@@ -42857,11 +42954,14 @@ class UserTokenProvider {
     this.options = options;
     this.waitMs = options.waitMs ?? DEVICE_CODE_WAIT_MS;
   }
+  get label() {
+    return this.spec.authMode === "browser" ? "browser" : "device-code";
+  }
   async getToken() {
     if (!this.flow && this.unreported) {
       const failure = this.unreported;
       this.unreported = null;
-      throw new Error(`Connection "${this.spec.name}": device-code sign-in failed: ${failure.message}`, {
+      throw new Error(`Connection "${this.spec.name}": ${this.label} sign-in failed: ${failure.message}`, {
         cause: failure
       });
     }
@@ -42884,10 +42984,9 @@ class UserTokenProvider {
     } finally {
       clearTimeout(timer);
     }
-    if (flow.prompt) {
-      throw new DeviceCodeSignInRequiredError(this.spec.name, flow.prompt.verificationUri, flow.prompt.userCode);
-    }
-    throw new Error(`Connection "${this.spec.name}": device-code sign-in did not start within ` + `${this.waitMs / 1000}s (no token and no sign-in prompt yet). It keeps running in ` + "the background \u2014 retry the call shortly.");
+    if (flow.prompt)
+      throw new SignInRequiredError(this.spec.name, flow.prompt);
+    throw new Error(`Connection "${this.spec.name}": ${this.label} sign-in did not start within ` + `${this.waitMs / 1000}s (no token and no sign-in prompt yet). It keeps running in ` + "the background \u2014 retry the call shortly.");
   }
   startFlow() {
     let signalPrompt = () => {};
@@ -42900,8 +42999,11 @@ class UserTokenProvider {
     };
     this.onPrompt = (info) => {
       flow.prompt = info;
-      process.stderr.write(`
+      process.stderr.write(info.kind === "device_code" ? `
 [wicket:${this.spec.name}] Sign in: ${info.verificationUri} code: ${info.userCode}
+
+` : `
+[wicket:${this.spec.name}] Sign in: a browser window opened \u2014 finish signing in there.
 
 `);
       signalPrompt();
@@ -42923,43 +43025,56 @@ class UserTokenProvider {
   }
   async acquire() {
     if (!this.credential) {
-      const create = this.options.createCredential ?? defaultDeviceCodeCredential(this.spec);
+      const create = this.options.createCredential ?? ((onPrompt) => createDelegatedCredential(this.spec, onPrompt));
       this.credential = await create((info) => this.onPrompt(info));
     }
     const token = await this.credential.getToken(DELEGATED_SCOPE);
     if (!token) {
-      throw new Error(`Connection "${this.spec.name}": device-code auth returned no token.`);
+      throw new Error(`Connection "${this.spec.name}": ${this.label} auth returned no token.`);
     }
     return token.token;
   }
 }
-function defaultDeviceCodeCredential(spec) {
-  return async (onPrompt) => {
-    const identity = await Promise.resolve().then(() => (init_esm8(), exports_esm));
-    const persist = spec.persistTokenCache && await enableTokenCachePersistence(identity.useIdentityPlugin);
-    const recordFile = authRecordPath(spec.name);
-    let record3 = persist ? readAuthRecord(recordFile, spec, identity.deserializeAuthenticationRecord) : undefined;
-    const credential = new identity.DeviceCodeCredential({
-      tenantId: spec.tenantId,
-      clientId: spec.clientId,
-      userPromptCallback: (info) => onPrompt({ verificationUri: info.verificationUri, userCode: info.userCode }),
-      ...persist ? { tokenCachePersistenceOptions: { enabled: true, name: TOKEN_CACHE_NAME } } : {},
-      ...record3 ? { authenticationRecord: record3 } : {}
-    });
-    if (!persist)
-      return credential;
-    return {
-      async getToken(scope) {
-        if (!record3) {
-          const fresh = await credential.authenticate(scope);
-          if (fresh) {
-            record3 = fresh;
-            writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
-          }
+async function createDelegatedCredential(target, onPrompt, opts = {}) {
+  const identity = opts.identity ?? await Promise.resolve().then(() => (init_esm8(), exports_esm));
+  const persist = target.persistTokenCache && await enableTokenCachePersistence(identity.useIdentityPlugin);
+  const recordFile = authRecordPath(target.name);
+  let record3 = persist ? readAuthRecord(recordFile, target, identity.deserializeAuthenticationRecord) : undefined;
+  const common = {
+    tenantId: target.tenantId,
+    clientId: target.clientId,
+    disableAutomaticAuthentication: true,
+    ...persist ? { tokenCachePersistenceOptions: { enabled: true, name: TOKEN_CACHE_NAME } } : {},
+    ...record3 ? { authenticationRecord: record3 } : {}
+  };
+  const credential = target.authMode === "browser" ? new identity.InteractiveBrowserCredential({ ...common, redirectUri: "http://localhost" }) : new identity.DeviceCodeCredential({
+    ...common,
+    userPromptCallback: (info) => onPrompt({ kind: "device_code", verificationUri: info.verificationUri, userCode: info.userCode })
+  });
+  const needsPerson = (e) => e instanceof Error && e.name === "AuthenticationRequiredError";
+  return {
+    async getToken(scope) {
+      if (record3) {
+        try {
+          return await credential.getToken(scope);
+        } catch (e) {
+          if (!needsPerson(e))
+            throw e;
         }
-        return credential.getToken(scope);
       }
-    };
+      if (opts.silentOnly)
+        throw new SignInNeededError(target.name);
+      if (target.authMode === "browser")
+        onPrompt({ kind: "browser" });
+      const fresh = await credential.authenticate(scope);
+      if (fresh) {
+        record3 = fresh;
+        if (persist)
+          writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
+      }
+      return credential.getToken(scope);
+    },
+    authenticationRecord: () => record3 ? identity.serializeAuthenticationRecord(record3) : undefined
   };
 }
 var TOKEN_CACHE_NAME = "wicket-mcp";
@@ -42995,7 +43110,7 @@ function writeAuthRecord(file, text) {
   }
 }
 function makeTokenSource(spec) {
-  return spec.authMode === "device_code" ? new UserTokenProvider(spec) : new AppTokenProvider(spec);
+  return isDelegated(spec.authMode) ? new UserTokenProvider(spec) : new AppTokenProvider(spec);
 }
 
 // src/apiCatalog.ts
@@ -43749,8 +43864,416 @@ function loadSkillDoc(dir = SKILL_DIR) {
   return doc2;
 }
 
+// src/connectionsFile.ts
+import { chmodSync, copyFileSync, existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, rmSync, writeFileSync as writeFileSync4 } from "fs";
+import { dirname as dirname5 } from "path";
+class ConnectionsFileUnreadableError extends Error {
+  file;
+  constructor(file, reason) {
+    super(`${file} cannot be read (${reason}); it was left as it is.`);
+    this.file = file;
+    this.name = "ConnectionsFileUnreadableError";
+  }
+}
+function readDoc(file) {
+  if (!existsSync4(file))
+    return { connections: {} };
+  let doc2;
+  try {
+    doc2 = JSON.parse(readFileSync6(file, "utf8"));
+  } catch (err) {
+    throw new ConnectionsFileUnreadableError(file, err instanceof Error ? err.message : String(err));
+  }
+  const isObject3 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObject3(doc2) || !isObject3(doc2.connections)) {
+    throw new ConnectionsFileUnreadableError(file, 'expected an object with a "connections" object');
+  }
+  return doc2;
+}
+function writeDoc(file, doc2) {
+  mkdirSync4(dirname5(file), { recursive: true, mode: 448 });
+  if (existsSync4(file)) {
+    copyFileSync(file, `${file}.bak`);
+    chmodSync(`${file}.bak`, 384);
+  }
+  const temp = `${file}.tmp-${process.pid}`;
+  writeFileSync4(temp, `${JSON.stringify(doc2, null, 2)}
+`, { mode: 384 });
+  renameSync3(temp, file);
+}
+function edit(change) {
+  const file = connectionsFile();
+  const doc2 = readDoc(file);
+  change(doc2);
+  writeDoc(file, doc2);
+}
+function upsertConnection(name4, fields, opts) {
+  edit((doc2) => {
+    const existing = doc2.connections[name4];
+    if (existing && !opts.replace)
+      throw new Error(`connection "${name4}" exists`);
+    const merged = { ...existing ?? {}, ...fields };
+    opts.validate?.(name4, merged);
+    doc2.connections[name4] = merged;
+    if (opts.makeDefault)
+      doc2.default = name4;
+  });
+}
+function removeConnection(name4) {
+  let defaultCleared = false;
+  edit((doc2) => {
+    if (!(name4 in doc2.connections))
+      throw new Error(`connection "${name4}" is not in ${connectionsFile()}`);
+    delete doc2.connections[name4];
+    if (doc2.default === name4) {
+      const left = Object.keys(doc2.connections);
+      if (left.length === 1)
+        doc2.default = left[0];
+      else if (left.length === 0)
+        delete doc2.default;
+      else
+        defaultCleared = true;
+    }
+  });
+  rmSync(authRecordPath(name4), { force: true });
+  return { defaultCleared };
+}
+function setDefaultConnection(name4) {
+  edit((doc2) => {
+    if (!(name4 in doc2.connections))
+      throw new Error(`connection "${name4}" is not in ${connectionsFile()}`);
+    doc2.default = name4;
+  });
+}
+function moveAsideBroken() {
+  const file = connectionsFile();
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  const target = `${file}.broken-${stamp}`;
+  renameSync3(file, target);
+  return target;
+}
+
+// src/setup.ts
+import { rmSync as rmSync2 } from "fs";
+var BC_API = "https://api.businesscentral.dynamics.com";
+var SCOPE2 = `${BC_API}/.default`;
+var GUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var ENVIRONMENT_RE2 = /^[A-Za-z0-9_-]{1,64}$/;
+var REQUEST_TIMEOUT_MS = 30000;
+var SETUP_SESSION_NAME = ".setup-session";
+function parseBcAddress(text) {
+  let url;
+  try {
+    url = new URL(text.trim());
+  } catch {
+    return;
+  }
+  if (url.hostname !== "businesscentral.dynamics.com" && !url.hostname.endsWith(".businesscentral.dynamics.com"))
+    return;
+  const segments = url.pathname.split("/").filter(Boolean);
+  const found = {};
+  if (segments[0] && (GUID_RE2.test(segments[0]) || segments[0].includes(".")))
+    found.tenant = segments.shift();
+  if (segments[0] && ENVIRONMENT_RE2.test(segments[0]))
+    found.environment = segments[0];
+  const company = url.searchParams.get("company");
+  if (company)
+    found.companyName = company;
+  return found;
+}
+async function tenantOfDomain(domain) {
+  try {
+    const res = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(domain)}/v2.0/.well-known/openid-configuration`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    if (!res.ok)
+      return;
+    const issuer = (await res.json()).issuer ?? "";
+    return issuer.split("/").find((part) => GUID_RE2.test(part));
+  } catch {
+    return;
+  }
+}
+async function locate(hint) {
+  const text = hint.trim();
+  const address = parseBcAddress(text);
+  let tenant;
+  const found = { unresolved: [] };
+  if (address) {
+    tenant = address.tenant;
+    if (address.environment)
+      found.environment = address.environment;
+    if (address.companyName)
+      found.companyName = address.companyName;
+  } else {
+    tenant = text.includes("@") ? text.slice(text.lastIndexOf("@") + 1) : text;
+  }
+  if (tenant) {
+    const id = GUID_RE2.test(tenant) ? tenant : await tenantOfDomain(tenant);
+    if (id)
+      found.tenantId = id.toLowerCase();
+  }
+  const result = {
+    ...found.tenantId ? { tenantId: found.tenantId } : {},
+    ...found.environment ? { environment: found.environment } : {},
+    ...found.companyName ? { companyName: found.companyName } : {},
+    unresolved: []
+  };
+  if (!result.tenantId)
+    result.unresolved.push("tenant");
+  if (!result.environment)
+    result.unresolved.push("environment");
+  if (!result.companyName)
+    result.unresolved.push("company");
+  return result;
+}
+var PENDING_LIMIT_MS = 10 * 60000;
+function claimsOf(token) {
+  try {
+    return JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
+class SetupSession {
+  flow;
+  createCredential;
+  waitMs;
+  now;
+  constructor(options = {}) {
+    this.createCredential = options.createCredential ?? createDelegatedCredential;
+    this.waitMs = options.waitMs ?? 1e4;
+    this.now = options.now ?? Date.now;
+  }
+  async signin(args) {
+    const key = JSON.stringify([args.method, args.tenantId, args.clientId, args.keychainService, args.keychainAccount]);
+    if (this.flow && (this.flow.key !== key || args.restart))
+      this.flow = undefined;
+    if (this.flow && !this.flow.settled && this.now() - this.flow.startedAt > PENDING_LIMIT_MS) {
+      this.flow = undefined;
+      return { state: "failed", message: "The sign-in was not finished within 10 minutes: sign-in timed out, start again." };
+    }
+    if (this.flow && this.flow.settled && "error" in this.flow.settled)
+      this.flow = undefined;
+    if (!this.flow) {
+      if (args.method === "client_credentials" && (!args.tenantId || !args.clientId)) {
+        return { state: "failed", message: "An app sign-in needs the tenantId and clientId of the app registration." };
+      }
+      this.flow = this.start(key, args);
+    }
+    const flow = this.flow;
+    let timer;
+    const window2 = new Promise((resolve) => {
+      timer = setTimeout(resolve, this.waitMs);
+    });
+    try {
+      await Promise.race([flow.result, flow.prompt ? window2 : Promise.race([flow.prompted, window2])]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (flow.settled && "error" in flow.settled) {
+      this.flow = undefined;
+      return { state: "failed", message: explainAuthError(flow.settled.error) };
+    }
+    if (flow.settled) {
+      const claims = claimsOf(flow.settled.token);
+      const tenantId = String(claims.tid ?? flow.target.tenantId);
+      flow.target = { ...flow.target, tenantId };
+      const who = claims.upn ?? claims.preferred_username ?? claims.unique_name;
+      return {
+        state: "signedIn",
+        ...typeof who === "string" ? { upn: who } : {},
+        ...flow.target.method === "client_credentials" ? { appId: String(claims.appid ?? claims.azp ?? flow.target.clientId) } : {},
+        tenantId
+      };
+    }
+    if (flow.prompt)
+      return { state: "pending", prompt: flow.prompt };
+    return { state: "failed", message: "The sign-in did not start; try again." };
+  }
+  start(key, args) {
+    const target = {
+      method: args.method,
+      tenantId: args.tenantId ?? "organizations",
+      clientId: args.clientId ?? DEFAULT_PUBLIC_CLIENT_ID,
+      ...args.keychainService ? { keychainService: args.keychainService } : {},
+      ...args.keychainAccount ? { keychainAccount: args.keychainAccount } : {}
+    };
+    let signalPrompt = () => {};
+    const flow = {
+      key,
+      startedAt: this.now(),
+      target,
+      prompted: new Promise((resolve) => {
+        signalPrompt = resolve;
+      }),
+      result: Promise.resolve({ error: undefined })
+    };
+    const acquire = async () => {
+      if (target.method === "client_credentials") {
+        return new AppTokenProvider(this.appSpec(target)).getToken();
+      }
+      rmSync2(authRecordPath(SETUP_SESSION_NAME), { force: true });
+      const delegated = {
+        name: SETUP_SESSION_NAME,
+        tenantId: target.tenantId,
+        clientId: target.clientId,
+        authMode: target.method,
+        persistTokenCache: true
+      };
+      flow.credential = await this.createCredential(delegated, (prompt) => {
+        flow.prompt = prompt;
+        signalPrompt();
+      });
+      const token = await flow.credential.getToken(SCOPE2);
+      if (!token)
+        throw new Error("The sign-in returned no token.");
+      return token.token;
+    };
+    flow.result = acquire().then((token) => flow.settled = { token }, (error2) => flow.settled = { error: error2 });
+    return flow;
+  }
+  appSpec(target) {
+    return {
+      name: SETUP_SESSION_NAME,
+      tenantId: target.tenantId,
+      environment: "setup",
+      companyId: "00000000-0000-0000-0000-000000000000",
+      authMode: "client_credentials",
+      clientId: target.clientId,
+      persistTokenCache: false,
+      readOnly: true,
+      ...target.keychainService ? { keychainService: target.keychainService } : {},
+      ...target.keychainAccount ? { keychainAccount: target.keychainAccount } : {}
+    };
+  }
+  token() {
+    const settled = this.flow?.settled;
+    if (!settled || !("token" in settled))
+      throw new Error("Setup is not signed in: call signin first.");
+    return settled.token;
+  }
+  get target() {
+    return this.flow?.target;
+  }
+  authenticationRecord() {
+    return this.flow?.credential?.authenticationRecord();
+  }
+}
+
+class HttpStatusError extends Error {
+  status;
+  constructor(status, body) {
+    super(`HTTP ${status}: ${body.slice(0, 300)}`);
+    this.status = status;
+    this.name = "HttpStatusError";
+  }
+}
+async function getJson(url, token) {
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  });
+  const text = await res.text();
+  if (!res.ok)
+    throw new HttpStatusError(res.status, text);
+  return JSON.parse(text);
+}
+async function listEnvironments(token) {
+  const body = await getJson(`${BC_API}/environments/v1.1`, token);
+  return (body.value ?? []).map((e) => ({ name: String(e.name), type: String(e.type), countryCode: String(e.countryCode) }));
+}
+async function listCompanies(token, tenantId, environment) {
+  const body = await getJson(`${BC_API}/v2.0/${encodeURIComponent(tenantId)}/${encodeURIComponent(environment)}/api/v2.0/companies`, token);
+  return (body.value ?? []).map((c) => ({ id: String(c.id), name: String(c.name), displayName: String(c.displayName ?? "") }));
+}
+function statusOf(err) {
+  const e = err;
+  const status = e?.problem?.status ?? e?.status;
+  return typeof status === "number" ? status : undefined;
+}
+function messageOf(err) {
+  if (err instanceof Error)
+    return err.message;
+  const problem = err?.problem;
+  return typeof problem?.detail === "string" ? problem.detail : String(err);
+}
+async function checkHealth(spec, whoami, opts = {}) {
+  try {
+    if (isDelegated(spec.authMode)) {
+      const create = opts.createCredential ?? createDelegatedCredential;
+      const credential = await create(spec, () => {}, { silentOnly: true });
+      await credential.getToken(SCOPE2);
+    } else {
+      await resolveSecret(spec);
+    }
+  } catch (err) {
+    if (err instanceof SignInNeededError)
+      return { state: "signInNeeded", message: "The saved sign-in is missing or expired: sign in again." };
+    if (!isDelegated(spec.authMode)) {
+      return { state: "secretMissing", message: "The client secret is not where the connection says (Keychain item or variable): store it again." };
+    }
+    return { state: "tokenRefused", message: explainAuthError(err) };
+  }
+  try {
+    return { state: "ok", message: "Connected.", identity: await whoami() };
+  } catch (err) {
+    const status = statusOf(err);
+    const type = err?.problem?.type;
+    if (typeof type === "string" && type.endsWith("sign-in-required")) {
+      return { state: "signInNeeded", message: "The saved sign-in is missing or expired: sign in again." };
+    }
+    if (status === 404)
+      return { state: "wicketNotFound", message: explainAuthError(err) };
+    if (status === 401 || status === 403)
+      return { state: "bcRefused", message: explainAuthError(err) };
+    if (/token request|AADSTS/.test(messageOf(err)))
+      return { state: "tokenRefused", message: explainAuthError(err) };
+    if (err instanceof TypeError || /timed out|fetch failed|ENOTFOUND|ECONNREFUSED/i.test(messageOf(err))) {
+      return { state: "unreachable", message: `Business Central could not be reached: ${messageOf(err).slice(0, 200)}` };
+    }
+    return { state: status ? "bcRefused" : "unreachable", message: explainAuthError(err) };
+  }
+}
+function explainListError(err, list, environment) {
+  if (/AADSTS/.test(messageOf(err)))
+    return explainAuthError(err);
+  const status = statusOf(err);
+  if (status === undefined)
+    return explainAuthError(err);
+  if (list === "environments") {
+    return `This account couldn't list the environments (HTTP ${status}): paste the Business Central address ` + "from your browser instead, or type the environment name.";
+  }
+  return `Business Central refused the company list for ${environment ?? "that environment"} (HTTP ${status}): check ` + "the environment name, and that this account can sign in to it in the browser.";
+}
+function explainAuthError(err) {
+  const text = messageOf(err);
+  if (/AADSTS50020/.test(text)) {
+    return "This account isn't a member or guest of that tenant: sign in with another account, or ask the tenant's admin for guest access.";
+  }
+  if (/AADSTS65001|consent_required/.test(text)) {
+    return "The app needs admin consent in that tenant: use the Wicket default client, or ask an admin to consent.";
+  }
+  if (/AADSTS700016/.test(text)) {
+    return "That client ID isn't known in this tenant: check the ID, or use the Wicket default client.";
+  }
+  if (/AADSTS7000215|AADSTS7000222/.test(text)) {
+    return "The client secret is wrong or expired: store the current secret in the Keychain again.";
+  }
+  const status = statusOf(err);
+  if (status === 401) {
+    return "Business Central doesn't know this user (or app) in that environment: the BC admin must add it.";
+  }
+  if (status === 403) {
+    return "Signed in, but there is no Wicket permission set: the BC admin assigns Wicket - Read (or Execute/Edit).";
+  }
+  if (status === 404) {
+    return "Wicket isn't installed in that environment, or the environment or company name is wrong.";
+  }
+  return text.slice(0, 300);
+}
+
 // src/index.ts
-var SERVER_VERSION = "2.3.0";
+var SERVER_VERSION = "2.4.0";
 var RPC_TIMEOUT_MS = 120000;
 var MUTATING_OPERATIONS = new Set(["insert", "modify", "delete", "invoke", "action"]);
 var UNMASK_AWARE_OPERATIONS = new Set(["query", "readBlob", "describe"]);
@@ -43761,6 +44284,7 @@ var DELETE_ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempoten
 var RUN_ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
 var CANCEL_ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 var SESSION_ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+var SETUP_ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
 var DELIVER_ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 var PROBLEM_BASE = "https://wicket.example/errors/";
 function isProblem(value) {
@@ -43841,7 +44365,7 @@ class WicketClient {
       try {
         token = await this.tokens.getToken();
       } catch (err) {
-        if (err instanceof DeviceCodeSignInRequiredError) {
+        if (err instanceof SignInRequiredError) {
           throw new WicketProblemError(this.signInProblem(operation, err));
         }
         throw err;
@@ -43972,14 +44496,19 @@ class WicketClient {
     };
   }
   signInProblem(operation, err) {
+    const base = { type: `${PROBLEM_BASE}sign-in-required`, title: "Sign-in required", status: 401, operation };
+    if (err.prompt.kind === "browser") {
+      return {
+        ...base,
+        detail: `connection "${this.spec.name}" uses browser sign-in: a sign-in window opened in your browser. ` + "Ask the user to finish signing in there, then retry the call. The sign-in keeps running in the " + "background, so the retry picks up the token."
+      };
+    }
+    const { verificationUri, userCode } = err.prompt;
     return {
-      type: `${PROBLEM_BASE}sign-in-required`,
-      title: "Sign-in required",
-      status: 401,
-      detail: `connection "${this.spec.name}" uses device_code sign-in. Ask the user to open ` + `${err.verificationUri} and enter the code ${err.userCode}, sign in, then retry the ` + "call. The sign-in keeps running in the background, so the retry picks up the token.",
-      operation,
-      verificationUri: err.verificationUri,
-      userCode: err.userCode
+      ...base,
+      detail: `connection "${this.spec.name}" uses device_code sign-in. Ask the user to open ` + `${verificationUri} and enter the code ${userCode}, sign in, then retry the ` + "call. The sign-in keeps running in the background, so the retry picks up the token.",
+      verificationUri,
+      userCode
     };
   }
 }
@@ -44010,17 +44539,32 @@ function liftJsonObjectString(value) {
 
 class ClientPool {
   registry;
+  tokensFor;
   clients = new Map;
-  constructor(registry2) {
+  constructor(registry2, tokensFor) {
     this.registry = registry2;
+    this.tokensFor = tokensFor;
   }
   get(connectionOverride) {
-    const spec = this.registry.resolve(connectionOverride);
-    let client = this.clients.get(spec.name);
-    if (!client) {
-      client = new WicketClient(spec);
-      this.clients.set(spec.name, client);
+    let spec;
+    try {
+      spec = this.registry.resolve(connectionOverride);
+    } catch (err) {
+      if (err instanceof ConnectionUnavailableError) {
+        throw new WicketProblemError({
+          type: `${PROBLEM_BASE}connection-unavailable`,
+          title: "No usable connection",
+          status: 503,
+          detail: err.message
+        });
+      }
+      throw err;
     }
+    const cached2 = this.clients.get(spec.name);
+    if (cached2 && cached2.spec === spec)
+      return cached2.client;
+    const client = new WicketClient(spec, this.tokensFor?.(spec));
+    this.clients.set(spec.name, { spec, client });
     return client;
   }
 }
@@ -44098,7 +44642,8 @@ var TOOL_NAMES = [
   "wicket_skill",
   "wicket_connections",
   "wicket_use",
-  "wicket_query_all"
+  "wicket_query_all",
+  "wicket_setup"
 ];
 var skillSchema = {
   mode: exports_external.enum(["toc", "section", "full"]).optional().describe('What to return: "toc" (default) \u2014 the guide description plus every file and its section titles ' + '(cheapest); "section" \u2014 one section or one whole reference file (pass `section`); "full" \u2014 the ' + "entire guide (large; prefer sections)."),
@@ -44248,7 +44793,7 @@ var queryAllSchema = {
   maxPages: exports_external.number().int().positive().optional().describe("Safety cap on the number of pages to follow (default 100)."),
   maxRows: exports_external.number().int().positive().max(QUERY_ALL_MAX_ROWS).optional().describe(`Cap on accumulated rows (default ${QUERY_ALL_DEFAULT_MAX_ROWS}, max ${QUERY_ALL_MAX_ROWS}). The walk ` + "stops after the page that reaches it (so the result can exceed it by up to one page) and " + 'returns "@truncated": true with the "@nextLink" cursor to resume from.')
 };
-function buildServer(pool, registry2) {
+function buildServer(pool, registry2, options = {}) {
   const server = new McpServer({ name: "wicket-mcp", version: SERVER_VERSION }, { instructions: instructionsFrom(loadSkillDoc()) });
   const tool = (name4, title, description, operation, inputSchema, annotations, refuse) => {
     const shape = { ...ConnectionOverride, ...inputSchema };
@@ -44487,7 +45032,12 @@ ${renderSkillToc(doc2)}`);
     annotations: READ_ANNOTATIONS
   }, async () => {
     try {
-      return ok({ connections: registry2.list(), current: registry2.current() });
+      return ok({
+        connections: registry2.list(),
+        current: registry2.current(),
+        ...registry2.problem ? { problem: registry2.problem } : {},
+        ...registry2.rejected.length ? { rejected: registry2.rejected } : {}
+      });
     } catch (err) {
       return fail(err);
     }
@@ -44575,6 +45125,157 @@ ${renderSkillToc(doc2)}`);
       return fail(err);
     }
   });
+  const setupSession = options.setupSession ?? new SetupSession;
+  const healthOf = (spec) => checkHealth(spec, () => pool.get(spec.name).call("whoAmI", {}), {
+    ...options.createCredential ? { createCredential: options.createCredential } : {}
+  });
+  const identityOf = (spec) => ({
+    name: spec.name,
+    authMode: spec.authMode,
+    tenantId: spec.tenantId,
+    clientId: spec.clientId,
+    environment: spec.environment,
+    companyId: spec.companyId,
+    ...spec.keychainService ? { keychainService: spec.keychainService, keychainAccount: spec.keychainAccount } : {},
+    ...spec.secretEnv ? { secretEnv: spec.secretEnv } : {}
+  });
+  const refuseEnv = (name4) => {
+    if (registry2.sourceOf(name4) === "env") {
+      throw new Error(`Connection "${name4}" comes from environment variables (BC_TENANT_ID etc.): change those, ` + "or save a connection under another name.");
+    }
+  };
+  const need = (value, what) => {
+    if (typeof value !== "string" || !value.trim())
+      throw new Error(`${what} is required for this action.`);
+    return value.trim();
+  };
+  server.registerTool("wicket_setup", {
+    title: "Set up Business Central connections",
+    description: "Add, fix, re-default or remove Wicket connections; use it when no connection is configured, " + "when a call fails with connection-unavailable or sign-in trouble, or when the user wants another " + "tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: " + "`status` (the file, any problem, each connection with a silent health check \u2014 never prompts); " + "`locate` {hint: a BC web address, an email or a domain} \u2192 tenantId and, from an address, " + "environment and companyName; `signin` {method: browser | device_code | client_credentials, " + "tenantId? (default organizations), clientId? (default: the Wicket default client), restart? " + "(start afresh: wrong account, closed window, expired code), " + "keychainService/keychainAccount for client_credentials} \u2192 pending with the prompt (call again " + "once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; " + "`companies` {environment}; `save` {name, environment, companyId, makeDefault?, replace?} writes " + "the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: " + "confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable " + "connections.json (only on the user's yes). Add = locate \u2192 signin \u2192 environments \u2192 companies \u2192 " + "save. Secrets never pass through this tool: a client secret is read from the Keychain item.",
+    inputSchema: {
+      action: exports_external.enum(["status", "locate", "signin", "environments", "companies", "save", "remove", "setDefault", "moveAsideBroken"]),
+      hint: exports_external.string().optional().describe("locate: a BC web address, an email or a domain."),
+      method: exports_external.enum(["browser", "device_code", "client_credentials"]).optional().describe("signin: how to sign in."),
+      restart: exports_external.boolean().optional().describe("signin: drop the current sign-in and start afresh (wrong account, closed window, expired code)."),
+      tenantId: exports_external.string().optional().describe("signin: the tenant (GUID or domain); required for client_credentials."),
+      clientId: exports_external.string().optional().describe("signin: the app registration; required for client_credentials."),
+      keychainService: exports_external.string().optional().describe('signin (client_credentials): Keychain service of the secret, usually "wicket".'),
+      keychainAccount: exports_external.string().optional().describe("signin (client_credentials): Keychain account of the secret, usually the connection name."),
+      environment: exports_external.string().optional().describe("companies / save: the environment name."),
+      companyId: exports_external.string().optional().describe("save: the company id from `companies`."),
+      name: exports_external.string().optional().describe("save / remove / setDefault: the connection name."),
+      makeDefault: exports_external.boolean().optional().describe("save: make it the default connection."),
+      replace: exports_external.boolean().optional().describe("save: overwrite an existing connection of that name (fields not given are kept).")
+    },
+    annotations: SETUP_ANNOTATIONS
+  }, async (args) => {
+    try {
+      switch (args.action) {
+        case "status": {
+          const connections = await Promise.all(registry2.list().map(async (c) => ({
+            ...identityOf(registry2.resolve(c.name)),
+            source: registry2.sourceOf(c.name),
+            isDefault: c.isDefault,
+            health: await healthOf(registry2.resolve(c.name))
+          })));
+          return ok({
+            file: connectionsFile(),
+            ...registry2.problem ? { problem: registry2.problem } : {},
+            rejected: registry2.rejected,
+            connections
+          });
+        }
+        case "locate":
+          return ok(await locate(need(args.hint, "hint")));
+        case "signin":
+          return ok(await setupSession.signin({
+            method: args.method ?? "browser",
+            ...args.restart ? { restart: true } : {},
+            ...args.tenantId ? { tenantId: args.tenantId } : {},
+            ...args.clientId ? { clientId: args.clientId } : {},
+            ...args.keychainService ? { keychainService: args.keychainService } : {},
+            ...args.keychainAccount ? { keychainAccount: args.keychainAccount } : {}
+          }));
+        case "environments": {
+          const token = setupSession.token();
+          try {
+            return ok({ value: await listEnvironments(token) });
+          } catch (err) {
+            return fail(new Error(explainListError(err, "environments")));
+          }
+        }
+        case "companies": {
+          const target = setupSession.target;
+          const token = setupSession.token();
+          const environment = need(args.environment, "environment");
+          try {
+            return ok({ value: await listCompanies(token, target.tenantId, environment) });
+          } catch (err) {
+            return fail(new Error(explainListError(err, "companies", environment)));
+          }
+        }
+        case "save": {
+          const name4 = need(args.name, "name");
+          refuseEnv(name4);
+          const target = setupSession.target;
+          try {
+            setupSession.token();
+          } catch {
+            throw new Error("Not signed in: sign in first (action signin), then save.");
+          }
+          const fields = {
+            tenantId: target.tenantId,
+            environment: need(args.environment, "environment"),
+            companyId: need(args.companyId, "companyId"),
+            authMode: target.method,
+            clientId: target.clientId,
+            ...target.method === "client_credentials" ? { keychainService: target.keychainService, keychainAccount: target.keychainAccount } : {}
+          };
+          upsertConnection(name4, fields, {
+            replace: args.replace ?? false,
+            makeDefault: args.makeDefault ?? false,
+            validate: (n, merged) => void validateConnectionEntry(n, merged)
+          });
+          const record3 = setupSession.authenticationRecord();
+          if (target.method !== "client_credentials" && record3) {
+            writeAuthRecord(authRecordPath(name4), record3);
+            rmSync3(authRecordPath(SETUP_SESSION_NAME), { force: true });
+          }
+          registry2.reload();
+          const rejected = registry2.rejected.find((r) => r.name === name4);
+          if (rejected)
+            throw new Error(`Saved, but the connection does not load: ${rejected.message}`);
+          return ok({ saved: name4, health: await healthOf(registry2.resolve(name4)) });
+        }
+        case "remove": {
+          const name4 = need(args.name, "name");
+          refuseEnv(name4);
+          const { defaultCleared } = removeConnection(name4);
+          registry2.reload();
+          return ok({
+            removed: name4,
+            ...defaultCleared ? { defaultCleared: true, next: "Ask which connection becomes the default (setDefault)." } : {},
+            connections: registry2.list(),
+            current: registry2.current()
+          });
+        }
+        case "setDefault": {
+          const name4 = need(args.name, "name");
+          refuseEnv(name4);
+          setDefaultConnection(name4);
+          registry2.reload();
+          return ok({ default: name4, current: registry2.current() });
+        }
+        case "moveAsideBroken": {
+          const movedTo = moveAsideBroken();
+          registry2.reload();
+          return ok({ movedTo });
+        }
+      }
+    } catch (err) {
+      return fail(new Error(explainAuthError(err)));
+    }
+  });
   return server;
 }
 function readPage(page) {
@@ -44596,7 +45297,7 @@ async function main() {
   const transport = new StdioServerTransport;
   await server.connect(transport);
   const cur = registry2.current();
-  process.stderr.write(`wicket-mcp ready \u2014 connections=${registry2.list().map((c) => c.name).join(",")} ` + `current=${cur.name}
+  process.stderr.write(`wicket-mcp ready \u2014 connections=${registry2.list().map((c) => c.name).join(",") || "(none)"} ` + `current=${cur.name ?? "(none)"}` + (registry2.problem ? ` problem=${registry2.problem.kind}` : "") + (registry2.rejected.length ? ` rejected=${registry2.rejected.map((r) => r.name).join(",")}` : "") + `
 `);
 }
 if (import.meta.main) {

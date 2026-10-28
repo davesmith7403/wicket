@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import type { ConnectionRegistry } from '../src/connections.ts';
+import { ConnectionRegistry } from '../src/connections.ts';
 import { TOOL_NAMES } from '../src/index.ts';
 import {
     COMPANY_A,
@@ -104,6 +104,7 @@ describe('tool inventory', () => {
                 'wicket_query_deliver',
                 'wicket_read_blob',
                 'wicket_requests',
+                'wicket_setup',
                 'wicket_skill',
                 'wicket_status',
                 'wicket_use',
@@ -111,7 +112,7 @@ describe('tool inventory', () => {
             ].sort(),
         );
         expect(tools.map((t) => t.name).sort()).toEqual([...TOOL_NAMES].sort());
-        const local = new Set(['wicket_connections', 'wicket_use', 'wicket_skill']);
+        const local = new Set(['wicket_connections', 'wicket_use', 'wicket_skill', 'wicket_setup']);
         for (const t of tools) {
             const props = Object.keys((t.inputSchema as { properties?: Record<string, unknown> }).properties ?? {});
             if (local.has(t.name)) expect(props).not.toContain('connection');
@@ -140,8 +141,10 @@ describe('tool inventory', () => {
             idempotentHint: false,
             openWorldHint: true,
         });
+        // Setup reaches Entra and Business Central's own APIs, and can remove a connection.
+        expect(ann('wicket_setup')).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
         for (const t of tools) {
-            if (t.name !== 'wicket_query_deliver') expect(t.annotations?.openWorldHint).toBe(false);
+            if (t.name !== 'wicket_query_deliver' && t.name !== 'wicket_setup') expect(t.annotations?.openWorldHint).toBe(false);
         }
     });
 
@@ -599,6 +602,39 @@ describe('wicket_connections / wicket_use', () => {
         expect(toolIsError(bad)).toBe(true);
         expect(toolText(bad)).toMatch(/Unknown connection "ghost"/);
         expect(registry.current().name).toBe('sandbox');
+    });
+
+    test('a tool call with no connection returns the connection-unavailable problem naming /wicket:setup', async () => {
+        await harness.close();
+        process.env.WICKET_CONNECTIONS_FILE = '/nonexistent/wicket-none/connections.json';
+        registry = ConnectionRegistry.load();
+        harness = await startServer(registry);
+
+        const res = await call('wicket_query', { tableId: 18 });
+        expect(toolIsError(res)).toBe(true);
+        const problem = toolJsonAs<{ type: string; status: number; detail: string }>(res);
+        expect(problem.type).toMatch(/connection-unavailable$/);
+        expect(problem.status).toBe(503);
+        expect(problem.detail).toMatch(/\/wicket:setup/);
+        expect(stub.requests).toHaveLength(0);
+
+        const listed = toolJsonAs<Record<string, unknown>>(await call('wicket_connections'));
+        expect(listed.connections).toEqual([]);
+        expect(listed.problem).toMatchObject({ kind: 'missing' });
+    });
+
+    test('a changed spec after reload gets a fresh client', async () => {
+        stub.rpc(() => odata({}));
+        await call('wicket_whoami');
+        tmp.write(
+            'connections.json',
+            JSON.stringify({ default: 'prod', connections: { prod: entry({ tenantId: 'tenant-sb', clientId: 'client-prod' }) } }),
+        );
+        registry.reload();
+        await call('wicket_whoami');
+        expect(stub.rpcRequests[0]!.url).toContain('/tenant-prod/');
+        expect(stub.rpcRequests[1]!.url).toContain('/tenant-sb/');
+        expect(stub.rpcRequests[1]!.headers.authorization).toBe('Bearer tok-sb');
     });
 });
 

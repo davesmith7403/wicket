@@ -102,15 +102,15 @@ Parallel reads in one turn; subagents for fan-out that would flood the context; 
 
 # Tool reference
 
-The 23 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
+The 24 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
 
 ## wicket_connections
 
-Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials` or `device_code`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`invoke`/`action` before anything is sent.
+Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials`, `device_code` or `browser`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`invoke`/`action` before anything is sent. When nothing usable is configured, the answer also carries `problem` (`missing`, `invalid` or `dangling-default`), and an entry set aside for a bad value is listed under `rejected` with its reason: offer `/wicket:setup`.
 
 ## wicket_whoami
 
-`{ userSecurityId, userId, company, readOnly, fieldPolicy, strongEtag, unmaskGranted, activeExceptions, serverTime }` — the principal and company the connection resolves to and the endpoint posture. One small call; cheaper than `wicket_capabilities` when identity is all you need. `serverTime` is the watermark to store for an incremental sync. A `device_code` connection answers `401 sign-in-required` with a URL and code until the user has signed in: show them, then retry.
+`{ userSecurityId, userId, company, readOnly, fieldPolicy, strongEtag, unmaskGranted, activeExceptions, serverTime }` — the principal and company the connection resolves to and the endpoint posture. One small call; cheaper than `wicket_capabilities` when identity is all you need. `serverTime` is the watermark to store for an incremental sync. A `device_code` connection answers `401 sign-in-required` with a URL and code until the user has signed in: show them, then retry. A `browser` connection answers the same problem without a code: a sign-in window has opened, so ask the user to finish there, then retry.
 
 ## wicket_capabilities
 
@@ -191,6 +191,10 @@ A BC web-client deep link for one record: `table` (a name such as `"Customer"` o
 ## wicket_skill
 
 This guide, with progressive disclosure: `mode:"toc"` (default) lists every file and section; `mode:"section"` with a section title or a reference file name (`filters`, `errors`, `writes`, `presenting`, `automation`, `tables`, `protocol`, `tools`) returns that text; `mode:"full"` returns everything (large). Local and free.
+
+## wicket_setup
+
+Adds, fixes, re-defaults and removes connections, and works when none is configured. In Claude Code, `/wicket:setup` drives it with questions; elsewhere follow its description. The add path is `locate` (a BC address, email or domain) → `signin` (`browser`, `device_code` or `client_credentials`; call it again while it answers `pending`) → `environments` → `companies` → `save`, which tests the new connection with `whoami`. `status` checks each connection without prompting a sign-in. Confirm with the user before `remove`. A client secret never passes through it: the user stores it in the Keychain themselves.
 
 ## wicket_use
 
@@ -360,7 +364,8 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `internal` (500) | An unhandled AL error, or a commit failure in which nothing persisted | Reads: retry with backoff. A keyed `insert`/`modify`/`delete`: resend with the **same** key (a 5xx is not stored). A keyed `invoke`/`action`: the same key answers `idempotency-indeterminate` — verify the result first |
 | `transport` (HTTP status, MCP) | BC's gateway answered non-200: 401/403 auth, 404 routing, 5xx outage; the handler never ran or its answer was lost | 4xx: fix per `detail` (a 401 was already retried once with a fresh token). 5xx on a write: resend with the same key, or query the records first when you sent none |
 | `transport-timeout` (504, MCP) | No answer within 120 s. The first heavy call to an idle sandbox (`capabilities`, a first `describe`) can take that long while the environment warms up, while `whoami` answers at once | Same as a 5xx: a read is retried once; for a slow query also narrow it. Several heavy metadata calls fired in parallel on a cold environment can all time out: retry them one at a time |
-| `sign-in-required` (401, MCP) | A `device_code` connection needs the user to sign in | Show `verificationUri` and `userCode`; retry after they sign in |
+| `sign-in-required` (401, MCP) | A `device_code` or `browser` connection needs the user to sign in | Device code: show `verificationUri` and `userCode`. Browser: say a sign-in window opened. Retry after they sign in |
+| `connection-unavailable` (503, MCP) | No connection is configured, connections.json cannot be read, the default names nothing usable, or the named connection was set aside for a bad value; nothing was sent | Offer `/wicket:setup` (or `wicket_setup` `status`); `detail` says which |
 | *no problem document at all* (a bare error such as "socket connection was closed", "MCP error", a timeout from the host) | The MCP connection itself dropped or the host cut the call; nothing says whether BC ran it | A read: retry once. A write: query the record first, or resend with the same `idempotencyKey` |
 | `async-start-failed` (503) | No background worker could start; the request is recorded as failed | Retry shortly |
 | `async-upload-failed` / `async-task-failed` / `async-stale` | Worker-side failure, reported on a request's `problem` by `wicket_status` | Read `problem.detail`; resubmit (the same key dedupes) |

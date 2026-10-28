@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DeviceCodeSignInRequiredError } from '../src/connections.ts';
+import { SignInRequiredError } from '../src/connections.ts';
 import {
     WicketClient,
     WicketProblemError,
@@ -351,7 +351,11 @@ describe('WicketClient device-code sign-in', () => {
         stub.rpc(() => odata({}));
         const client = new WicketClient(spec({ name: 'me', authMode: 'device_code' }), {
             getToken: async () => {
-                throw new DeviceCodeSignInRequiredError('me', 'https://microsoft.com/devicelogin', 'ABCD-EFGH');
+                throw new SignInRequiredError('me', {
+                    kind: 'device_code',
+                    verificationUri: 'https://microsoft.com/devicelogin',
+                    userCode: 'ABCD-EFGH',
+                });
             },
         });
         const err = await problemOf(client.call('whoAmI', {}));
@@ -365,6 +369,21 @@ describe('WicketClient device-code sign-in', () => {
         expect(err.problem.detail).toContain('https://microsoft.com/devicelogin');
         expect(err.problem.detail).toContain('ABCD-EFGH');
         expect(err.problem.detail).toContain('sign in, then retry the call');
+        expect(stub.requests).toHaveLength(0);
+    });
+
+    test('the sign-in problem for a browser connection says a window opened and carries no userCode', async () => {
+        const client = new WicketClient(spec({ name: 'web', authMode: 'browser' }), {
+            getToken: async () => {
+                throw new SignInRequiredError('web', { kind: 'browser' });
+            },
+        });
+        const err = await problemOf(client.call('whoAmI', {}));
+        expect(err.problem).toMatchObject({ type: 'https://wicket.example/errors/sign-in-required', status: 401 });
+        expect(err.problem.detail).toContain('sign-in window opened in your browser');
+        expect(err.problem.detail).toContain('retry');
+        expect(err.problem).not.toHaveProperty('userCode');
+        expect(err.problem).not.toHaveProperty('verificationUri');
         expect(stub.requests).toHaveLength(0);
     });
 });

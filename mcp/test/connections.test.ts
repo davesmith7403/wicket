@@ -10,13 +10,17 @@ import { cacheDir } from '../src/apiCatalog.ts';
 import {
     AppTokenProvider,
     ConnectionRegistry,
-    DeviceCodeSignInRequiredError,
+    ConnectionUnavailableError,
+    DEFAULT_PUBLIC_CLIENT_ID,
     authRecordPath,
     configHome,
     envSetting,
     keychain,
     UserTokenProvider,
-    type DeviceCodePrompt,
+    SignInNeededError,
+    SignInRequiredError,
+    createDelegatedCredential,
+    type SignInPrompt,
     isTimeoutError,
     makeTokenSource,
     resolveSecret,
@@ -48,6 +52,18 @@ afterEach(() => {
     tmp.cleanup();
     restoreEnv();
 });
+
+/** Load `doc` and return why `name` was set aside (asserting it was not loaded). */
+function rejection(doc: unknown, name: string): string {
+    return rejectionOf(loadRegistry(tmp, doc), name);
+}
+
+function rejectionOf(reg: ConnectionRegistry, name: string, source: 'file' | 'env' = 'file'): string {
+    expect(reg.list().map((c) => c.name)).not.toContain(name);
+    const hit = reg.rejected.find((r) => r.name === name && r.source === source);
+    expect(hit).toBeDefined();
+    return hit!.message;
+}
 
 // ---------------------------------------------------------------------------
 // load(): env-implicit "default"
@@ -107,14 +123,14 @@ describe('ConnectionRegistry.load from environment', () => {
     test('an env default without any secret fails at load, not at the first token fetch', () => {
         Object.assign(process.env, envDefault, { BC_CLIENT_SECRET: undefined });
         delete process.env.BC_CLIENT_SECRET;
-        expect(() => ConnectionRegistry.load()).toThrow(/no secret source configured/);
+        expect(rejectionOf(ConnectionRegistry.load(), 'default', 'env')).toMatch(/no secret source configured/);
     });
 
     test('a braced or malformed BC_COMPANY_ID is rejected (it is interpolated into the URL)', () => {
         Object.assign(process.env, envDefault, { BC_COMPANY_ID: `{${COMPANY_A}}` });
-        expect(() => ConnectionRegistry.load()).toThrow(/brace-less GUID/);
+        expect(rejectionOf(ConnectionRegistry.load(), 'default', 'env')).toMatch(/brace-less GUID/);
         Object.assign(process.env, envDefault, { BC_COMPANY_ID: 'CRONUS' });
-        expect(() => ConnectionRegistry.load()).toThrow(/brace-less GUID/);
+        expect(rejectionOf(ConnectionRegistry.load(), 'default', 'env')).toMatch(/brace-less GUID/);
     });
 
     test('BC_TENANT_ID / BC_ENVIRONMENT / BC_BASE_URL / BC_ORIGIN are validated at load', () => {
@@ -129,7 +145,7 @@ describe('ConnectionRegistry.load from environment', () => {
             delete process.env.BC_BASE_URL;
             delete process.env.BC_ORIGIN;
             process.env[key] = value;
-            expect(() => ConnectionRegistry.load()).toThrow(pattern);
+            expect(rejectionOf(ConnectionRegistry.load(), 'default', 'env')).toMatch(pattern);
         }
         Object.assign(process.env, envDefault, {
             BC_TENANT_ID: 'contoso.onmicrosoft.com',
@@ -143,18 +159,29 @@ describe('ConnectionRegistry.load from environment', () => {
         Object.assign(process.env, envDefault, { BC_COMPANY_ID: 'CRONUS' });
         const reg = loadRegistry(tmp, { connections: { default: entry({ tenantId: 'file-tenant' }), other: entry() } });
         expect(reg.resolve().tenantId).toBe('file-tenant');
-        // ...but it still fails fast when nothing replaces it.
-        expect(() => loadRegistry(tmp, { connections: { other: entry() } })).toThrow(/BC_COMPANY_ID "CRONUS"/);
+        expect(reg.rejected).toEqual([]);
+        // ...and when nothing replaces it, it is set aside while the file's connections load.
+        const alone = loadRegistry(tmp, { connections: { other: entry() } });
+        expect(rejectionOf(alone, 'default', 'env')).toMatch(/BC_COMPANY_ID "CRONUS"/);
+        expect(alone.resolve('other').name).toBe('other');
     });
 
     test('an incomplete env quartet is ignored rather than half-loaded', () => {
         Object.assign(process.env, envDefault);
         delete process.env.BC_ENVIRONMENT;
-        expect(() => ConnectionRegistry.load()).toThrow(/No Wicket connections configured/);
+        const reg = ConnectionRegistry.load();
+        expect(reg.list()).toEqual([]);
+        expect(reg.rejected).toEqual([]);
+        expect(reg.problem?.kind).toBe('missing');
     });
 
-    test('no env and no file is a clear startup error', () => {
-        expect(() => ConnectionRegistry.load()).toThrow(/No Wicket connections configured/);
+    test('no env and no file starts empty with a missing problem', () => {
+        const reg = ConnectionRegistry.load();
+        expect(reg.list()).toEqual([]);
+        expect(reg.problem).toMatchObject({ kind: 'missing' });
+        expect(reg.current().name).toBeUndefined();
+        expect(() => reg.resolve()).toThrow(ConnectionUnavailableError);
+        expect(() => reg.resolve()).toThrow(/Run \/wicket:setup \(or call the wicket_setup tool\)\.$/);
     });
 });
 
@@ -218,50 +245,58 @@ describe('ConnectionRegistry.load from connections.json', () => {
         expect(reg.current().name).toBe('zeta');
     });
 
-    test('a declared default that names no connection fails fast', () => {
-        expect(() =>
-            loadRegistry(tmp, { default: 'ghost', connections: { real: entry() } }),
-        ).toThrow(/declares default "ghost".*Available: real/);
+    test('a dangling default does not fall back to the first connection', () => {
+        const reg = loadRegistry(tmp, { default: 'ghost', connections: { real: entry() } });
+        expect(reg.problem).toMatchObject({ kind: 'dangling-default' });
+        expect(reg.problem?.message).toMatch(/declares default "ghost".*Available: real/);
+        expect(reg.current().name).toBeUndefined();
+        expect(() => reg.resolve()).toThrow(ConnectionUnavailableError);
+        expect(reg.resolve('real').name).toBe('real');
     });
 
-    test('an unknown key (typo) fails the load and names the file and the path', () => {
-        expect(() =>
-            loadRegistry(tmp, {
-                connections: { contoso: entry({ keychainSevice: 'oops' }) },
-            }),
-        ).toThrow(/Failed to load .*connections\.json: connections\.contoso: Unrecognized key/);
+    test('an unknown key (typo) sets that entry aside and names the path; its sibling loads', () => {
+        const doc = { connections: { contoso: entry({ keychainSevice: 'oops' }), good: entry() } };
+        expect(rejection(doc, 'contoso')).toMatch(/connections\.contoso: Unrecognized key/);
+        expect(loadRegistry(tmp, doc).resolve().name).toBe('good');
     });
 
-    test('malformed JSON is wrapped with the file name', () => {
+    test('malformed JSON is an invalid problem naming the file', () => {
         process.env.WICKET_CONNECTIONS_FILE = tmp.write('connections.json', '{ not json');
-        expect(() => ConnectionRegistry.load()).toThrow(/Failed to load .*connections\.json/);
+        const reg = ConnectionRegistry.load();
+        expect(reg.problem).toMatchObject({ kind: 'invalid' });
+        expect(reg.problem?.file).toMatch(/connections\.json$/);
+        expect(reg.problem?.message).toMatch(/connections\.json/);
+        expect(reg.list()).toEqual([]);
+    });
+
+    test('a top level that is not a connections object is an invalid problem', () => {
+        const reg = loadRegistry(tmp, { connections: [] });
+        expect(reg.problem).toMatchObject({ kind: 'invalid' });
     });
 
     test('connection names are restricted to the envelope-safe charset', () => {
-        expect(() =>
-            loadRegistry(tmp, { connections: { 'bad name!': entry() } }),
-        ).toThrow(/Connection name "bad name!" is invalid/);
-        expect(() =>
-            loadRegistry(tmp, { connections: { ['x'.repeat(65)]: entry() } }),
-        ).toThrow(/is invalid/);
+        expect(rejection({ connections: { 'bad name!': entry() } }, 'bad name!')).toMatch(
+            /Connection name "bad name!" is invalid/,
+        );
+        expect(rejection({ connections: { ['x'.repeat(65)]: entry() } }, 'x'.repeat(65))).toMatch(/is invalid/);
         expect(loadRegistry(tmp, { connections: { 'ok.Name_1-2': entry() } }).resolve().name).toBe(
             'ok.Name_1-2',
         );
     });
 
     test('tenantId, environment and baseUrl must be URL-safe (https only)', () => {
-        expect(() => loadRegistry(tmp, { connections: { a: entry({ tenantId: 'x/y' }) } })).toThrow(
+        expect(rejection({ connections: { a: entry({ tenantId: 'x/y' }) } }, 'a')).toMatch(
             /connections\.a\.tenantId: must be a tenant GUID or domain/,
         );
-        expect(() => loadRegistry(tmp, { connections: { a: entry({ environment: 'Prod/../x' }) } })).toThrow(
+        expect(rejection({ connections: { a: entry({ environment: 'Prod/../x' }) } }, 'a')).toMatch(
             /connections\.a\.environment: must match/,
         );
-        expect(() => loadRegistry(tmp, { connections: { a: entry({ baseUrl: 'http://bc.local/BC' }) } })).toThrow(
+        expect(rejection({ connections: { a: entry({ baseUrl: 'http://bc.local/BC' }) } }, 'a')).toMatch(
             /connections\.a\.baseUrl: must be an absolute https:\/\/ URL/,
         );
-        expect(() => loadRegistry(tmp, { connections: { a: entry({ baseUrl: 'bc.local' }) } })).toThrow(/https/);
+        expect(rejection({ connections: { a: entry({ baseUrl: 'bc.local' }) } }, 'a')).toMatch(/https/);
         // A local dev container over plain http is fine: the token never leaves the machine.
-        expect(() => loadRegistry(tmp, { connections: { a: entry({ baseUrl: 'http://localhost:7048/BC' }) } })).not.toThrow();
+        expect(loadRegistry(tmp, { connections: { a: entry({ baseUrl: 'http://localhost:7048/BC' }) } }).rejected).toEqual([]);
         const reg = loadRegistry(tmp, {
             connections: {
                 a: entry({
@@ -275,17 +310,15 @@ describe('ConnectionRegistry.load from connections.json', () => {
     });
 
     test('companyId must be a brace-less GUID', () => {
-        expect(() =>
-            loadRegistry(tmp, { connections: { a: entry({ companyId: `{${COMPANY_A}}` }) } }),
-        ).toThrow(/brace-less GUID/);
+        expect(rejection({ connections: { a: entry({ companyId: `{${COMPANY_A}}` }) } }, 'a')).toMatch(
+            /brace-less GUID/,
+        );
     });
 
     test('a companies allowlist must contain the pinned companyId (case-insensitive)', () => {
-        expect(() =>
-            loadRegistry(tmp, {
-                connections: { a: entry({ companies: [COMPANY_B] }) },
-            }),
-        ).toThrow(/not in this connection's companies allowlist/);
+        expect(rejection({ connections: { a: entry({ companies: [COMPANY_B] }) } }, 'a')).toMatch(
+            /not in this connection's companies allowlist/,
+        );
         const reg = loadRegistry(tmp, {
             connections: { a: entry({ companies: [COMPANY_B, COMPANY_A.toUpperCase()] }) },
         });
@@ -293,22 +326,64 @@ describe('ConnectionRegistry.load from connections.json', () => {
     });
 
     test('a half-configured keychain pair is an error', () => {
-        expect(() =>
-            loadRegistry(tmp, {
-                connections: { a: entry({ keychainService: 'svc', secretEnv: undefined }) },
-            }),
-        ).toThrow(/needs BOTH keychainService and keychainAccount/);
-        expect(() =>
-            loadRegistry(tmp, {
-                connections: { a: entry({ keychainAccount: 'acct', secretEnv: undefined }) },
-            }),
-        ).toThrow(/needs BOTH/);
+        expect(rejection({ connections: { a: entry({ keychainService: 'svc', secretEnv: undefined }) } }, 'a')).toMatch(
+            /needs BOTH keychainService and keychainAccount/,
+        );
+        expect(rejection({ connections: { a: entry({ keychainAccount: 'acct', secretEnv: undefined }) } }, 'a')).toMatch(
+            /needs BOTH/,
+        );
     });
 
     test('client_credentials without any secret source is an error', () => {
-        expect(() =>
-            loadRegistry(tmp, { connections: { a: entry({ secretEnv: undefined }) } }),
-        ).toThrow(/no secret source configured/);
+        expect(rejection({ connections: { a: entry({ secretEnv: undefined }) } }, 'a')).toMatch(
+            /no secret source configured/,
+        );
+    });
+
+    test('browser and device_code default clientId to the Wicket default client; client_credentials needs one', () => {
+        const reg = loadRegistry(tmp, {
+            connections: {
+                web: entry({ authMode: 'browser', clientId: undefined, secretEnv: undefined }),
+                code: entry({ authMode: 'device_code', clientId: undefined, secretEnv: undefined }),
+                own: entry({ authMode: 'browser', clientId: 'my-client', secretEnv: undefined }),
+                app: entry({ clientId: undefined }),
+            },
+        });
+        expect(DEFAULT_PUBLIC_CLIENT_ID).toBe('1950a258-227b-4e31-a9cf-717495945fc2');
+        expect(reg.resolve('web').clientId).toBe(DEFAULT_PUBLIC_CLIENT_ID);
+        expect(reg.resolve('code').clientId).toBe(DEFAULT_PUBLIC_CLIENT_ID);
+        expect(reg.resolve('own').clientId).toBe('my-client');
+        expect(rejectionOf(reg, 'app')).toMatch(/clientId/);
+    });
+
+    test('reload keeps the spec object of an unchanged entry, so its client and sign-in survive', () => {
+        const reg = loadRegistry(tmp, { connections: { a: entry(), b: entry() } });
+        const a = reg.resolve('a');
+        const b = reg.resolve('b');
+        tmp.write('connections.json', JSON.stringify({ connections: { a: entry(), b: entry({ tenantId: 'moved' }) } }));
+        reg.reload();
+        expect(reg.resolve('a')).toBe(a);
+        expect(reg.resolve('b')).not.toBe(b);
+    });
+
+    test('an unreadable file problem does not quote the file content', () => {
+        process.env.WICKET_CONNECTIONS_FILE = tmp.write('connections.json', '{ "connections": { "a": { "clientSecret": SUPERSECRET } } }');
+        const reg = ConnectionRegistry.load();
+        expect(reg.problem?.kind).toBe('invalid');
+        expect(reg.problem?.message).toMatch(/not valid JSON/);
+        expect(reg.problem?.message).not.toContain('SUPERSECRET');
+    });
+
+    test('reload picks up a new entry and drops the selection of a removed one', () => {
+        const reg = loadRegistry(tmp, { default: 'a', connections: { a: entry(), b: entry() } });
+        reg.select('b');
+        tmp.write('connections.json', JSON.stringify({ default: 'a', connections: { a: entry(), c: entry() } }));
+        reg.reload();
+        expect(reg.list().map((c) => c.name)).toEqual(['a', 'c']);
+        expect(reg.current()).toEqual({ name: 'a', isSessionSelection: false });
+        reg.select('c');
+        reg.reload();
+        expect(reg.current()).toEqual({ name: 'c', isSessionSelection: true });
     });
 
     test('device_code needs no secret; a configured one is ignored with a warning', () => {
@@ -586,17 +661,17 @@ describe('AppTokenProvider', () => {
 // ---------------------------------------------------------------------------
 
 describe('UserTokenProvider', () => {
-    const PROMPT: DeviceCodePrompt = { verificationUri: 'https://microsoft.com/devicelogin', userCode: 'ABCD-EFGH' };
+    const PROMPT: SignInPrompt = { kind: 'device_code', verificationUri: 'https://microsoft.com/devicelogin', userCode: 'ABCD-EFGH' };
 
     /**
      * A scripted DeviceCodeCredential: each getToken either resolves at once (a cached token),
      * or prompts and then waits until `signIn()` (the human) completes it.
      */
-    function fakeCredential(mode: 'cached' | 'prompt' | 'silent') {
+    function fakeCredential(mode: 'cached' | 'prompt' | 'browser' | 'silent') {
         let complete: ((t: string) => void) | undefined;
         let fail: ((e: Error) => void) | undefined;
         const state = { created: 0, calls: 0 };
-        const createCredential = async (onPrompt: (info: DeviceCodePrompt) => void) => {
+        const createCredential = async (onPrompt: (info: SignInPrompt) => void) => {
             state.created++;
             return {
                 getToken: (_scope: string) => {
@@ -606,6 +681,7 @@ describe('UserTokenProvider', () => {
                         complete = (t) => resolve({ token: t });
                         fail = reject;
                         if (mode === 'prompt') queueMicrotask(() => onPrompt(PROMPT));
+                        if (mode === 'browser') queueMicrotask(() => onPrompt({ kind: 'browser' }));
                     });
                 },
             };
@@ -648,8 +724,8 @@ describe('UserTokenProvider', () => {
         }
         // It returned on the prompt, not after the wait window.
         expect(Date.now() - started).toBeLessThan(1_000);
-        expect(first).toBeInstanceOf(DeviceCodeSignInRequiredError);
-        expect(first).toMatchObject({ connection: 'me', verificationUri: PROMPT.verificationUri, userCode: 'ABCD-EFGH' });
+        expect(first).toBeInstanceOf(SignInRequiredError);
+        expect(first).toMatchObject({ connection: 'me', prompt: PROMPT });
         expect(err.lines.join('')).toContain('[wicket:me] Sign in: https://microsoft.com/devicelogin code: ABCD-EFGH');
 
         // The human signs in while the next call is waiting: it receives the in-flight token.
@@ -667,8 +743,8 @@ describe('UserTokenProvider', () => {
         });
         const err = captureStderr();
         try {
-            await expect(provider.getToken()).rejects.toBeInstanceOf(DeviceCodeSignInRequiredError);
-            await expect(provider.getToken()).rejects.toMatchObject({ userCode: 'ABCD-EFGH' });
+            await expect(provider.getToken()).rejects.toBeInstanceOf(SignInRequiredError);
+            await expect(provider.getToken()).rejects.toMatchObject({ prompt: PROMPT });
         } finally {
             err.restore();
         }
@@ -715,7 +791,7 @@ describe('UserTokenProvider', () => {
         });
         const err = captureStderr();
         try {
-            await expect(provider.getToken()).rejects.toBeInstanceOf(DeviceCodeSignInRequiredError);
+            await expect(provider.getToken()).rejects.toBeInstanceOf(SignInRequiredError);
             // The human signs in, but the token request is refused (e.g. AADSTS consent).
             cred.expire();
             await Bun.sleep(1);
@@ -724,12 +800,124 @@ describe('UserTokenProvider', () => {
             );
             expect(cred.state.calls).toBe(1);
             // Reported once: the call after that starts a fresh flow.
-            await expect(provider.getToken()).rejects.toBeInstanceOf(DeviceCodeSignInRequiredError);
+            await expect(provider.getToken()).rejects.toBeInstanceOf(SignInRequiredError);
             expect(cred.state.calls).toBe(2);
         } finally {
             err.restore();
         }
         expect(err.lines.join('')).toContain('[wicket:me] Sign-in failed: device code expired');
+    });
+});
+
+describe('UserTokenProvider (browser)', () => {
+    test('a browser connection that needs interaction fails fast with a browser sign-in and the retry gets the token', async () => {
+        let complete: ((t: string) => void) | undefined;
+        const createCredential = async (onPrompt: (info: SignInPrompt) => void) => ({
+            getToken: () =>
+                new Promise<{ token: string } | null>((resolve) => {
+                    complete = (t) => resolve({ token: t });
+                    queueMicrotask(() => onPrompt({ kind: 'browser' }));
+                }),
+        });
+        const provider = new UserTokenProvider(spec({ name: 'web', authMode: 'browser' }), { createCredential, waitMs: 5_000 });
+        const err = captureStderr();
+        let first: unknown;
+        try {
+            await provider.getToken();
+        } catch (e) {
+            first = e;
+        } finally {
+            err.restore();
+        }
+        expect(first).toBeInstanceOf(SignInRequiredError);
+        expect(first).toMatchObject({ connection: 'web', prompt: { kind: 'browser' } });
+        expect(err.lines.join('')).toContain('[wicket:web] Sign in: a browser window opened');
+        const second = provider.getToken();
+        complete!('web-tok');
+        expect(await second).toBe('web-tok');
+    });
+});
+
+describe('createDelegatedCredential', () => {
+    /** A stand-in for @azure/identity: tokens are silent once authenticated, else AuthenticationRequiredError. */
+    function fakeIdentity() {
+        const log: string[] = [];
+        class AuthenticationRequiredError extends Error {
+            override name = 'AuthenticationRequiredError';
+        }
+        function make(kind: string) {
+            return class {
+                private record: unknown;
+                constructor(readonly options: Record<string, unknown>) {
+                    log.push(`new ${kind} disable=${String(options.disableAutomaticAuthentication)}`);
+                    this.record = options.authenticationRecord;
+                    if (kind === 'device') {
+                        (this as { prompt?: () => void }).prompt = () =>
+                            (options.userPromptCallback as (i: unknown) => void)({ verificationUri: 'https://microsoft.com/devicelogin', userCode: 'CODE-1' });
+                    }
+                }
+                async getToken() {
+                    log.push('getToken');
+                    if (!this.record) throw new AuthenticationRequiredError('interaction required');
+                    return { token: `${kind}-tok`, expiresOnTimestamp: 0 };
+                }
+                async authenticate() {
+                    log.push('authenticate');
+                    (this as { prompt?: () => void }).prompt?.();
+                    this.record = { tenantId: 't', clientId: 'c', username: 'me@contoso.com' };
+                    return this.record;
+                }
+            };
+        }
+        return {
+            log,
+            module: {
+                InteractiveBrowserCredential: make('browser'),
+                DeviceCodeCredential: make('device'),
+                AuthenticationRequiredError,
+                useIdentityPlugin: () => {},
+                serializeAuthenticationRecord: (r: unknown) => JSON.stringify(r),
+                deserializeAuthenticationRecord: (t: string) => JSON.parse(t),
+            },
+        };
+    }
+    const target = (authMode: 'browser' | 'device_code') => ({
+        name: 'me',
+        tenantId: 'organizations',
+        clientId: 'client-a',
+        authMode,
+        persistTokenCache: false,
+    });
+
+    test('browser tries silently, then prompts and authenticates, and exposes the account record', async () => {
+        const id = fakeIdentity();
+        const prompts: SignInPrompt[] = [];
+        const cred = await createDelegatedCredential(target('browser'), (p) => prompts.push(p), { identity: id.module as never });
+        expect(cred.authenticationRecord()).toBeUndefined();
+        expect(await cred.getToken('scope')).toMatchObject({ token: 'browser-tok' });
+        expect(prompts).toEqual([{ kind: 'browser' }]);
+        expect(id.log).toEqual(['new browser disable=true', 'authenticate', 'getToken']);
+        expect(JSON.parse(cred.authenticationRecord()!)).toMatchObject({ username: 'me@contoso.com' });
+    });
+
+    test('device code reports the URL and code through the prompt', async () => {
+        const id = fakeIdentity();
+        const prompts: SignInPrompt[] = [];
+        const cred = await createDelegatedCredential(target('device_code'), (p) => prompts.push(p), { identity: id.module as never });
+        await cred.getToken('scope');
+        expect(prompts).toEqual([{ kind: 'device_code', verificationUri: 'https://microsoft.com/devicelogin', userCode: 'CODE-1' }]);
+    });
+
+    test('silentOnly never prompts: interaction needed is a SignInNeededError', async () => {
+        const id = fakeIdentity();
+        const prompts: SignInPrompt[] = [];
+        const cred = await createDelegatedCredential(target('browser'), (p) => prompts.push(p), {
+            identity: id.module as never,
+            silentOnly: true,
+        });
+        await expect(cred.getToken('scope')).rejects.toBeInstanceOf(SignInNeededError);
+        expect(prompts).toEqual([]);
+        expect(id.log).not.toContain('authenticate');
     });
 });
 
@@ -741,6 +929,7 @@ describe('makeTokenSource', () => {
     test('picks the provider by authMode', () => {
         expect(makeTokenSource(spec())).toBeInstanceOf(AppTokenProvider);
         expect(makeTokenSource(spec({ authMode: 'device_code' }))).toBeInstanceOf(UserTokenProvider);
+        expect(makeTokenSource(spec({ authMode: 'browser' }))).toBeInstanceOf(UserTokenProvider);
     });
 });
 
@@ -805,9 +994,11 @@ describe('config locations', () => {
         expect(ConnectionRegistry.load().list().map((c) => c.name)).toEqual(['home']);
     });
 
-    test('with no file anywhere the error points at ~/.config/wicket', () => {
+    test('with no file anywhere the problem points at the wicket config folder', () => {
         delete process.env.WICKET_CONNECTIONS_FILE;
-        expect(() => ConnectionRegistry.load()).toThrow(/~\/\.config\/wicket\/connections\.json/);
+        const reg = ConnectionRegistry.load();
+        expect(reg.problem?.file).toBe(join(configHome.dir, 'wicket', 'connections.json'));
+        expect(() => reg.resolve()).toThrow(/No Business Central connection is configured/);
     });
 
     test('device-code records are saved under wicket/auth, or under WICKET_AUTH_DIR when set', () => {

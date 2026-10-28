@@ -6,7 +6,7 @@
     {
       "name": "wicket",
       "source": "./plugin",
-      "description": "The wicket_* MCP tools, the Wicket usage skill, and /wicket:orient and /wicket:inventory."
+      "description": "The wicket_* MCP tools, the Wicket usage skill, and /wicket:setup, /wicket:orient and /wicket:inventory."
     }
   ]
 }

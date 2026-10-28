@@ -27,13 +27,20 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
     ConnectionRegistry,
-    DeviceCodeSignInRequiredError,
+    ConnectionUnavailableError,
+    SignInRequiredError,
+    authRecordPath,
+    connectionsFile,
+    createDelegatedCredential,
+    validateConnectionEntry,
+    writeAuthRecord,
     isTimeoutError,
     makeTokenSource,
     type ConnectionSpec,
@@ -58,6 +65,17 @@ import {
     upsertSection,
 } from './schemaKnowledge.js';
 import { findSkillSection, instructionsFrom, loadSkillDoc, renderSkillToc } from './skill.js';
+import { moveAsideBroken, removeConnection, setDefaultConnection, upsertConnection } from './connectionsFile.js';
+import {
+    SETUP_SESSION_NAME,
+    SetupSession,
+    checkHealth,
+    explainAuthError,
+    explainListError,
+    listCompanies,
+    listEnvironments,
+    locate,
+} from './setup.js';
 
 export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSkillDoc, renderSkillToc, skillFiles } from './skill.js';
 
@@ -66,7 +84,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.3.0';
+export const SERVER_VERSION = '2.4.0';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -103,6 +121,8 @@ const SESSION_ANNOTATIONS: ToolAnnotations = { readOnlyHint: false, destructiveH
 // Async delivery creates a request row, uploads a package to Azure Blob storage and hands back a
 // shareable link — not read-only, and open-world (it reaches storage outside BC). idempotentHint
 // stays false: only a caller-supplied idempotencyKey dedupes a resubmit.
+/** Setup reaches Entra and Business Central's own APIs, edits connections.json, and can remove a connection. */
+const SETUP_ANNOTATIONS: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
 const DELIVER_ANNOTATIONS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 
 /** Synthetic (MCP-generated) problem types. BC's own problems use the same base URL. */
@@ -304,7 +324,7 @@ export class WicketClient {
                 token = await this.tokens.getToken();
             } catch (err) {
                 // device_code needs the human first: hand the agent the URL + code as a problem.
-                if (err instanceof DeviceCodeSignInRequiredError) {
+                if (err instanceof SignInRequiredError) {
                     throw new WicketProblemError(this.signInProblem(operation, err));
                 }
                 throw err;
@@ -492,18 +512,26 @@ export class WicketClient {
         };
     }
 
-    private signInProblem(operation: string, err: DeviceCodeSignInRequiredError): Rfc7807Problem {
+    private signInProblem(operation: string, err: SignInRequiredError): Rfc7807Problem {
+        const base = { type: `${PROBLEM_BASE}sign-in-required`, title: 'Sign-in required', status: 401, operation };
+        if (err.prompt.kind === 'browser') {
+            return {
+                ...base,
+                detail:
+                    `connection "${this.spec.name}" uses browser sign-in: a sign-in window opened in your browser. ` +
+                    'Ask the user to finish signing in there, then retry the call. The sign-in keeps running in the ' +
+                    'background, so the retry picks up the token.',
+            };
+        }
+        const { verificationUri, userCode } = err.prompt;
         return {
-            type: `${PROBLEM_BASE}sign-in-required`,
-            title: 'Sign-in required',
-            status: 401,
+            ...base,
             detail:
                 `connection "${this.spec.name}" uses device_code sign-in. Ask the user to open ` +
-                `${err.verificationUri} and enter the code ${err.userCode}, sign in, then retry the ` +
+                `${verificationUri} and enter the code ${userCode}, sign in, then retry the ` +
                 'call. The sign-in keeps running in the background, so the retry picks up the token.',
-            operation,
-            verificationUri: err.verificationUri,
-            userCode: err.userCode,
+            verificationUri,
+            userCode,
         };
     }
 }
@@ -558,16 +586,34 @@ export function liftJsonObjectString(value: unknown): unknown {
  * resolution ladder (per-call override -> session selection -> default).
  */
 export class ClientPool {
-    private readonly clients = new Map<string, WicketClient>();
-    constructor(private readonly registry: ConnectionRegistry) {}
+    private readonly clients = new Map<string, { spec: ConnectionSpec; client: WicketClient }>();
+    /** `tokensFor` is a test seam: a token source for a spec, instead of the one its authMode picks. */
+    constructor(
+        private readonly registry: ConnectionRegistry,
+        private readonly tokensFor?: (spec: ConnectionSpec) => TokenSource | undefined,
+    ) {}
 
     get(connectionOverride?: string): WicketClient {
-        const spec = this.registry.resolve(connectionOverride);
-        let client = this.clients.get(spec.name);
-        if (!client) {
-            client = new WicketClient(spec);
-            this.clients.set(spec.name, client);
+        let spec: ConnectionSpec;
+        try {
+            spec = this.registry.resolve(connectionOverride);
+        } catch (err) {
+            if (err instanceof ConnectionUnavailableError) {
+                throw new WicketProblemError({
+                    type: `${PROBLEM_BASE}connection-unavailable`,
+                    title: 'No usable connection',
+                    status: 503,
+                    detail: err.message,
+                });
+            }
+            throw err;
         }
+        // A registry reload replaces the spec object of a changed entry: build a fresh client
+        // (and token source) for it rather than keep calling the old tenant with the old token.
+        const cached = this.clients.get(spec.name);
+        if (cached && cached.spec === spec) return cached.client;
+        const client = new WicketClient(spec, this.tokensFor?.(spec));
+        this.clients.set(spec.name, { spec, client });
         return client;
     }
 }
@@ -676,6 +722,7 @@ export const TOOL_NAMES = [
     'wicket_connections',
     'wicket_use',
     'wicket_query_all',
+    'wicket_setup',
 ] as const;
 
 const skillSchema = {
@@ -1133,7 +1180,14 @@ const queryAllSchema = {
 // Server
 // ---------------------------------------------------------------------------
 
-export function buildServer(pool: ClientPool, registry: ConnectionRegistry): McpServer {
+export interface BuildServerOptions {
+    /** The setup sign-in session (a seam for tests); one per server otherwise. */
+    setupSession?: SetupSession;
+    /** How setup's health checks build a delegated credential (a seam for tests). */
+    createCredential?: typeof createDelegatedCredential;
+}
+
+export function buildServer(pool: ClientPool, registry: ConnectionRegistry, options: BuildServerOptions = {}): McpServer {
     // The skill's essentials ride along as MCP `instructions`: hosts inject them into the system
     // prompt, so they are the one piece of guidance an agent sees before its first call.
     const server = new McpServer(
@@ -1750,7 +1804,12 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry): Mcp
         },
         async (): Promise<CallToolResult> => {
             try {
-                return ok({ connections: registry.list(), current: registry.current() });
+                return ok({
+                    connections: registry.list(),
+                    current: registry.current(),
+                    ...(registry.problem ? { problem: registry.problem } : {}),
+                    ...(registry.rejected.length ? { rejected: registry.rejected } : {}),
+                });
             } catch (err) {
                 return fail(err);
             }
@@ -1900,6 +1959,193 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry): Mcp
         },
     );
 
+    // --- Guided setup: works with no connection at all, so it is not a BC-endpoint tool. ---
+    const setupSession = options.setupSession ?? new SetupSession();
+    const healthOf = (spec: ConnectionSpec) =>
+        checkHealth(spec, () => pool.get(spec.name).call('whoAmI', {}), {
+            ...(options.createCredential ? { createCredential: options.createCredential } : {}),
+        });
+    // What Fix needs to sign a connection in again as it was: never a secret, only where it lives.
+    const identityOf = (spec: ConnectionSpec) => ({
+        name: spec.name,
+        authMode: spec.authMode,
+        tenantId: spec.tenantId,
+        clientId: spec.clientId,
+        environment: spec.environment,
+        companyId: spec.companyId,
+        ...(spec.keychainService ? { keychainService: spec.keychainService, keychainAccount: spec.keychainAccount } : {}),
+        ...(spec.secretEnv ? { secretEnv: spec.secretEnv } : {}),
+    });
+    const refuseEnv = (name: string) => {
+        if (registry.sourceOf(name) === 'env') {
+            throw new Error(
+                `Connection "${name}" comes from environment variables (BC_TENANT_ID etc.): change those, ` +
+                    'or save a connection under another name.',
+            );
+        }
+    };
+    const need = (value: unknown, what: string): string => {
+        if (typeof value !== 'string' || !value.trim()) throw new Error(`${what} is required for this action.`);
+        return value.trim();
+    };
+
+    server.registerTool(
+        'wicket_setup',
+        {
+            title: 'Set up Business Central connections',
+            description:
+                'Add, fix, re-default or remove Wicket connections; use it when no connection is configured, ' +
+                'when a call fails with connection-unavailable or sign-in trouble, or when the user wants another ' +
+                'tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: ' +
+                '`status` (the file, any problem, each connection with a silent health check — never prompts); ' +
+                '`locate` {hint: a BC web address, an email or a domain} → tenantId and, from an address, ' +
+                'environment and companyName; `signin` {method: browser | device_code | client_credentials, ' +
+                'tenantId? (default organizations), clientId? (default: the Wicket default client), restart? ' +
+                '(start afresh: wrong account, closed window, expired code), ' +
+                'keychainService/keychainAccount for client_credentials} → pending with the prompt (call again ' +
+                'once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; ' +
+                '`companies` {environment}; `save` {name, environment, companyId, makeDefault?, replace?} writes ' +
+                'the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: ' +
+                'confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable ' +
+                'connections.json (only on the user\'s yes). Add = locate → signin → environments → companies → ' +
+                'save. Secrets never pass through this tool: a client secret is read from the Keychain item.',
+            inputSchema: {
+                action: z.enum(['status', 'locate', 'signin', 'environments', 'companies', 'save', 'remove', 'setDefault', 'moveAsideBroken']),
+                hint: z.string().optional().describe('locate: a BC web address, an email or a domain.'),
+                method: z.enum(['browser', 'device_code', 'client_credentials']).optional().describe('signin: how to sign in.'),
+                restart: z
+                    .boolean()
+                    .optional()
+                    .describe('signin: drop the current sign-in and start afresh (wrong account, closed window, expired code).'),
+                tenantId: z.string().optional().describe('signin: the tenant (GUID or domain); required for client_credentials.'),
+                clientId: z.string().optional().describe('signin: the app registration; required for client_credentials.'),
+                keychainService: z.string().optional().describe('signin (client_credentials): Keychain service of the secret, usually "wicket".'),
+                keychainAccount: z.string().optional().describe('signin (client_credentials): Keychain account of the secret, usually the connection name.'),
+                environment: z.string().optional().describe('companies / save: the environment name.'),
+                companyId: z.string().optional().describe('save: the company id from `companies`.'),
+                name: z.string().optional().describe('save / remove / setDefault: the connection name.'),
+                makeDefault: z.boolean().optional().describe('save: make it the default connection.'),
+                replace: z.boolean().optional().describe('save: overwrite an existing connection of that name (fields not given are kept).'),
+            },
+            annotations: SETUP_ANNOTATIONS,
+        },
+        async (args): Promise<CallToolResult> => {
+            try {
+                switch (args.action) {
+                    case 'status': {
+                        const connections = await Promise.all(
+                            registry.list().map(async (c) => ({
+                                ...identityOf(registry.resolve(c.name)),
+                                source: registry.sourceOf(c.name),
+                                isDefault: c.isDefault,
+                                health: await healthOf(registry.resolve(c.name)),
+                            })),
+                        );
+                        return ok({
+                            file: connectionsFile(),
+                            ...(registry.problem ? { problem: registry.problem } : {}),
+                            rejected: registry.rejected,
+                            connections,
+                        });
+                    }
+                    case 'locate':
+                        return ok(await locate(need(args.hint, 'hint')));
+                    case 'signin':
+                        return ok(
+                            await setupSession.signin({
+                                method: args.method ?? 'browser',
+                                ...(args.restart ? { restart: true } : {}),
+                                ...(args.tenantId ? { tenantId: args.tenantId } : {}),
+                                ...(args.clientId ? { clientId: args.clientId } : {}),
+                                ...(args.keychainService ? { keychainService: args.keychainService } : {}),
+                                ...(args.keychainAccount ? { keychainAccount: args.keychainAccount } : {}),
+                            }),
+                        );
+                    case 'environments': {
+                        const token = setupSession.token();
+                        try {
+                            return ok({ value: await listEnvironments(token) });
+                        } catch (err) {
+                            return fail(new Error(explainListError(err, 'environments')));
+                        }
+                    }
+                    case 'companies': {
+                        const target = setupSession.target;
+                        const token = setupSession.token();
+                        const environment = need(args.environment, 'environment');
+                        try {
+                            return ok({ value: await listCompanies(token, target!.tenantId, environment) });
+                        } catch (err) {
+                            return fail(new Error(explainListError(err, 'companies', environment)));
+                        }
+                    }
+                    case 'save': {
+                        const name = need(args.name, 'name');
+                        refuseEnv(name);
+                        const target = setupSession.target;
+                        try {
+                            setupSession.token();
+                        } catch {
+                            throw new Error('Not signed in: sign in first (action signin), then save.');
+                        }
+                        const fields: Record<string, unknown> = {
+                            tenantId: target!.tenantId,
+                            environment: need(args.environment, 'environment'),
+                            companyId: need(args.companyId, 'companyId'),
+                            authMode: target!.method,
+                            // Always written, even when it is the default client: a pre-2.4 server
+                            // requires the field.
+                            clientId: target!.clientId,
+                            ...(target!.method === 'client_credentials'
+                                ? { keychainService: target!.keychainService, keychainAccount: target!.keychainAccount }
+                                : {}),
+                        };
+                        upsertConnection(name, fields, {
+                            replace: args.replace ?? false,
+                            makeDefault: args.makeDefault ?? false,
+                            validate: (n, merged) => void validateConnectionEntry(n, merged),
+                        });
+                        const record = setupSession.authenticationRecord();
+                        if (target!.method !== 'client_credentials' && record) {
+                            writeAuthRecord(authRecordPath(name), record);
+                            rmSync(authRecordPath(SETUP_SESSION_NAME), { force: true });
+                        }
+                        registry.reload();
+                        const rejected = registry.rejected.find((r) => r.name === name);
+                        if (rejected) throw new Error(`Saved, but the connection does not load: ${rejected.message}`);
+                        return ok({ saved: name, health: await healthOf(registry.resolve(name)) });
+                    }
+                    case 'remove': {
+                        const name = need(args.name, 'name');
+                        refuseEnv(name);
+                        const { defaultCleared } = removeConnection(name);
+                        registry.reload();
+                        return ok({
+                            removed: name,
+                            ...(defaultCleared ? { defaultCleared: true, next: 'Ask which connection becomes the default (setDefault).' } : {}),
+                            connections: registry.list(),
+                            current: registry.current(),
+                        });
+                    }
+                    case 'setDefault': {
+                        const name = need(args.name, 'name');
+                        refuseEnv(name);
+                        setDefaultConnection(name);
+                        registry.reload();
+                        return ok({ default: name, current: registry.current() });
+                    }
+                    case 'moveAsideBroken': {
+                        const movedTo = moveAsideBroken();
+                        registry.reload();
+                        return ok({ movedTo });
+                    }
+                }
+            } catch (err) {
+                return fail(new Error(explainAuthError(err)));
+            }
+        },
+    );
+
     return server;
 }
 
@@ -1937,8 +2183,11 @@ async function main(): Promise<void> {
     // stdio servers communicate over stdout/stdin only; log to stderr.
     const cur = registry.current();
     process.stderr.write(
-        `wicket-mcp ready — connections=${registry.list().map((c) => c.name).join(',')} ` +
-            `current=${cur.name}\n`,
+        `wicket-mcp ready — connections=${registry.list().map((c) => c.name).join(',') || '(none)'} ` +
+            `current=${cur.name ?? '(none)'}` +
+            (registry.problem ? ` problem=${registry.problem.kind}` : '') +
+            (registry.rejected.length ? ` rejected=${registry.rejected.map((r) => r.name).join(',')}` : '') +
+            '\n',
     );
 }
 

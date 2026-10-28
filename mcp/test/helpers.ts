@@ -18,8 +18,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ConnectionRegistry, configHome, type ConnectionSpec } from '../src/connections.ts';
-import { ClientPool, buildServer } from '../src/index.ts';
+import { ConnectionRegistry, configHome, type ConnectionSpec, type TokenSource } from '../src/connections.ts';
+import { ClientPool, buildServer, type BuildServerOptions } from '../src/index.ts';
 
 export const COMPANY_A = '11111111-1111-1111-1111-111111111111';
 export const COMPANY_B = '22222222-2222-2222-2222-222222222222';
@@ -290,9 +290,12 @@ export interface ServerHarness {
     close(): Promise<void>;
 }
 
-export async function startServer(registry: ConnectionRegistry): Promise<ServerHarness> {
-    const pool = new ClientPool(registry);
-    const server = buildServer(pool, registry);
+export async function startServer(
+    registry: ConnectionRegistry,
+    options: BuildServerOptions & { tokens?: (spec: ConnectionSpec) => TokenSource | undefined } = {},
+): Promise<ServerHarness> {
+    const pool = new ClientPool(registry, options.tokens);
+    const server = buildServer(pool, registry, options);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
     const client = new Client({ name: 'wicket-mcp-test', version: '0.0.0' });

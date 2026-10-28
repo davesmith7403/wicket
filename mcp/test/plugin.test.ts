@@ -47,4 +47,15 @@ describe('plugin', () => {
             expect(text).toContain('mcp__plugin_wicket_wicket__wicket_whoami');
         }
     });
+
+    test('/wicket:setup is a model-invocable skill whose allowed tools are AskUserQuestion and the setup tools', () => {
+        const text = readFileSync(join(PLUGIN_DIR, 'skills', 'setup', 'SKILL.md'), 'utf8');
+        const frontmatter = text.split('---')[1] ?? '';
+        expect(frontmatter).not.toContain('disable-model-invocation');
+        expect(frontmatter).toMatch(/^description: .+/m);
+        expect(frontmatter).toContain('AskUserQuestion');
+        expect(frontmatter).toContain('mcp__plugin_wicket_wicket__wicket_setup');
+        expect(frontmatter).toContain('mcp__plugin_wicket_wicket__wicket_connections');
+        expect(frontmatter).not.toMatch(/\bBash\b/);
+    });
 });
