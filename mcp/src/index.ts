@@ -76,6 +76,7 @@ import {
     listCompanies,
     listEnvironments,
     locate,
+    matchCompany,
 } from './setup.js';
 
 export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSkillDoc, renderSkillToc, skillFiles } from './skill.js';
@@ -85,7 +86,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.4.1';
+export const SERVER_VERSION = '2.4.2';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -197,6 +198,11 @@ export class WicketClient {
         // the envelope origin charset [A-Za-z0-9._@/+:-], <=256 chars — so this is safe.
         this.origin = spec.origin ?? `mcp.wicket/${SERVER_VERSION}+${spec.name}`;
         this.companyId = spec.companyId;
+    }
+
+    /** Whether this client's token source already holds a delegated sign-in. */
+    signedIn(): boolean {
+        return this.tokens.signedIn?.() ?? false;
     }
 
     private operationUrl(operation: string): string {
@@ -1965,6 +1971,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
     const healthOf = (spec: ConnectionSpec) =>
         checkHealth(spec, () => pool.get(spec.name).call('whoAmI', {}), {
             ...(options.createCredential ? { createCredential: options.createCredential } : {}),
+            signedInHere: () => pool.get(spec.name).signedIn(),
         });
     // What Fix needs to sign a connection in again as it was: never a secret, only where it lives.
     const identityOf = (spec: ConnectionSpec) => ({
@@ -2014,7 +2021,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 '(start afresh: wrong account, closed window, expired code), ' +
                 'keychainService/keychainAccount for client_credentials} → pending with the prompt (call again ' +
                 'once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; ' +
-                '`companies` {environment}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes ' +
+                '`companies` {environment, companyName? (→ `match`, the company of that name)}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes ' +
                 'the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: ' +
                 'confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable ' +
                 'connections.json (only on the user\'s yes). Add = locate → signin → environments → companies → ' +
@@ -2033,7 +2040,10 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 keychainAccount: z.string().optional().describe('signin (client_credentials): Keychain account of the secret, usually the connection name.'),
                 environment: z.string().optional().describe('companies / save: the environment name.'),
                 companyId: z.string().optional().describe('save: the company id from `companies`.'),
-                companyName: z.string().optional().describe('save: the company name, kept as the connection description when it has none.'),
+                companyName: z
+                    .string()
+                    .optional()
+                    .describe('companies: the name from locate, answered as `match`; save: the company name, kept as the connection description when it has none.'),
                 name: z.string().optional().describe('save / remove / setDefault: the connection name.'),
                 makeDefault: z.boolean().optional().describe('save: make it the default connection.'),
                 replace: z.boolean().optional().describe('save: overwrite an existing connection of that name (fields not given are kept).'),
@@ -2078,7 +2088,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                             }),
                         );
                     case 'environments': {
-                        const token = setupSession.token();
+                        const token = await setupSession.token();
                         try {
                             return ok({ value: await listEnvironments(token) });
                         } catch (err) {
@@ -2087,10 +2097,12 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                     }
                     case 'companies': {
                         const target = setupSession.target;
-                        const token = setupSession.token();
+                        const token = await setupSession.token();
                         const environment = need(args.environment, 'environment');
                         try {
-                            return ok({ value: await listCompanies(token, target!.tenantId, environment) });
+                            const companies = await listCompanies(token, target!.tenantId, environment);
+                            const match = args.companyName ? matchCompany(companies, args.companyName) : undefined;
+                            return ok({ value: companies, ...(match ? { match } : {}) });
                         } catch (err) {
                             return fail(new Error(explainListError(err, 'companies', environment)));
                         }
@@ -2100,7 +2112,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         refuseEnv(name);
                         const target = setupSession.target;
                         try {
-                            setupSession.token();
+                            await setupSession.token();
                         } catch {
                             throw new Error('Not signed in: sign in first (action signin), then save.');
                         }
@@ -2121,6 +2133,12 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                             makeDefault: args.makeDefault ?? false,
                             // A label for listings that does not depend on reaching BC; never over a user's own.
                             ...(args.companyName ? { defaults: { description: `${args.companyName} · ${fields.environment}` } } : {}),
+                            // Only the secret source this sign-in uses stays: a person's sign-in has none,
+                            // and an app's secret is the Keychain item.
+                            drop:
+                                target!.method === 'client_credentials'
+                                    ? ['secretEnv', 'clientSecret']
+                                    : ['keychainService', 'keychainAccount', 'secretEnv', 'clientSecret'],
                             validate: (n, merged) => void validateConnectionEntry(n, merged),
                         });
                         const record = setupSession.authenticationRecord();
@@ -2153,6 +2171,10 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         return ok({ default: name, current: registry.current() });
                     }
                     case 'moveAsideBroken': {
+                        registry.reload();
+                        if (registry.problem?.kind !== 'invalid') {
+                            throw new Error(`${connectionsFile()} can be read (or does not exist): nothing to move aside.`);
+                        }
                         const movedTo = moveAsideBroken();
                         registry.reload();
                         return ok({ movedTo });

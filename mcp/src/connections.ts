@@ -186,6 +186,8 @@ const ConnectionsFile = z.object({
 }).strict();
 
 const CONNECTION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** Object-prototype keys: as a key of the connections object they would read or set the prototype. */
+const RESERVED_NAMES: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
  * When a connection carries a `companies` allowlist, its pinned companyId must be a
@@ -253,6 +255,9 @@ function errorText(err: unknown): string {
 export function validateConnectionEntry(name: string, raw: unknown): ConnectionSpec {
     if (!CONNECTION_NAME_RE.test(name)) {
         throw new Error(`Connection name "${name}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
+    }
+    if (RESERVED_NAMES.has(name)) {
+        throw new Error(`Connection name "${name}" is invalid (a reserved word; choose another name).`);
     }
     const result = ConnectionEntry.safeParse(raw);
     if (!result.success) {
@@ -626,6 +631,8 @@ export interface TokenSource {
      * cannot force a refresh omits it, and the client then does not retry a 401.
      */
     invalidate?(): void;
+    /** True once this source holds a delegated sign-in; lets a health check skip the saved-record probe. */
+    signedIn?(): boolean;
 }
 
 /** client_credentials — app identity (unchanged semantics from the single-connection server). */
@@ -732,7 +739,7 @@ export class SignInNeededError extends Error {
 
 /** The slice of a delegated credential the provider uses — a seam for tests. */
 export interface DeviceCodeCredentialLike {
-    getToken(scope: string): Promise<{ token: string } | null>;
+    getToken(scope: string, options?: { abortSignal?: AbortSignal }): Promise<{ token: string } | null>;
 }
 
 export interface UserTokenProviderOptions {
@@ -780,6 +787,7 @@ export class UserTokenProvider implements TokenSource {
     /** Where the credential's prompt callback reports to — the flow currently running. */
     private onPrompt: (info: SignInPrompt) => void = () => {};
     private readonly waitMs: number;
+    private hasToken = false;
 
     constructor(
         private readonly spec: ConnectionSpec,
@@ -790,6 +798,10 @@ export class UserTokenProvider implements TokenSource {
 
     private get label(): string {
         return this.spec.authMode === 'browser' ? 'browser' : 'device-code';
+    }
+
+    signedIn(): boolean {
+        return this.hasToken;
     }
 
     async getToken(): Promise<string> {
@@ -880,6 +892,7 @@ export class UserTokenProvider implements TokenSource {
                 `Connection "${this.spec.name}": ${this.label} auth returned no token.`,
             );
         }
+        this.hasToken = true;
         return token.token;
     }
 }
@@ -933,22 +946,22 @@ export async function createDelegatedCredential(
               });
     const needsPerson = (e: unknown) => e instanceof Error && e.name === 'AuthenticationRequiredError';
     return {
-        async getToken(scope: string) {
+        async getToken(scope: string, options: { abortSignal?: AbortSignal } = {}) {
             if (record) {
                 try {
-                    return await credential.getToken(scope);
+                    return await credential.getToken(scope, options);
                 } catch (e) {
                     if (!needsPerson(e)) throw e;
                 }
             }
             if (opts.silentOnly) throw new SignInNeededError(target.name);
             if (target.authMode === 'browser') onPrompt({ kind: 'browser' });
-            const fresh = await credential.authenticate(scope);
+            const fresh = await credential.authenticate(scope, options);
             if (fresh) {
                 record = fresh;
                 if (persist) writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
             }
-            return credential.getToken(scope);
+            return credential.getToken(scope, options);
         },
         authenticationRecord: () => (record ? identity.serializeAuthenticationRecord(record) : undefined),
     };

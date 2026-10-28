@@ -64,7 +64,7 @@ Show IDs (tenant, company, client) only if the user asks for them. Then ask what
    - For `failed`, show the message and offer to try again, or to use another sign-in method.
    - For `signedIn`, ask **"Signed in as `<upn>`. Is that the right account?"** On No, call `signin` with the same arguments plus `restart: true`, and tell them to choose the other account in the window that opens.
 5. **Environment.** Skip this step when step 3 gave one. Otherwise call `environments`. With one environment, just confirm it. With several, ask, preferring a sandbox when the user has said they're testing. If the call fails, ask for the BC address instead and `locate` it.
-6. **Company.** Call `companies` with the environment. If step 3 gave a `companyName`, preselect the company with that name or display name. With one company, confirm it. Otherwise ask by name.
+6. **Company.** Call `companies` with the environment, plus the `companyName` from step 3 when there is one. When the answer has a `match`, offer that company first (Recommended). With one company, confirm it. Otherwise ask by name.
 7. **Name.** Suggest `<company>-<environment>`: lower case, with anything outside `a-z0-9-` turned into `-`. When that name is taken, add `-2`. Offer the suggestion (Recommended) or a typed name. When other connections exist, also ask whether this one becomes the default.
 8. **Save and test.** Call `save` with `name`, `environment`, `companyId`, `companyName` (the company's name from step 6) and `makeDefault`.
    - If it answers that the name exists, ask whether to replace it. Only on a yes, save again with `replace: true`.
@@ -91,12 +91,12 @@ Explain the connection's `health.state` in one sentence, then offer the matching
 
 | state | fix |
 |---|---|
-| `signInNeeded` | Sign in again: `signin` with `restart: true` and the connection's `authMode` as `method`, plus the `tenantId` and `clientId` from its status row (and its `keychainService`/`keychainAccount` for an app). Then `save` with `replace: true` and the same name, environment and company. |
+| `signInNeeded` | When the message says the connection keeps no saved sign-in, nothing needs fixing: the first Wicket call shows the sign-in prompt. Otherwise, sign in again: `signin` with `restart: true` and the connection's `authMode` as `method`, plus the `tenantId` and `clientId` from its status row (and its `keychainService`/`keychainAccount` for an app). Then `save` with `replace: true` and the same name, environment and company. |
 | `secretMissing` | The Keychain line from 2b step 4 (same name), then `status` again. |
 | `tokenRefused` | Show the message. A wrong or expired secret goes back to the Keychain line; an unknown client ID or missing consent means rerunning **Add** with Wicket's default client, or asking the tenant's admin. |
 | `wicketNotFound` | Say that Wicket isn't installed in that environment, or that the environment was renamed. Offer to pick the environment again (`environments`), then save with `replace: true`. |
 | `bcRefused` | Show the message: the BC admin must add the user or app, or assign a Wicket permission set. Change nothing here. |
-| `unreachable` | Say Business Central didn't answer. Suggest checking the network and running `/wicket:setup` again. |
+| `unreachable` | Say Business Central didn't answer in time. Suggest checking the network and running `/wicket:setup` again. |
 
 If the company is gone or renamed, pick it again with `companies`. For anything else, rerun **Add** with the current values as the recommended choices.
 

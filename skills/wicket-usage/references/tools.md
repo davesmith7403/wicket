@@ -92,7 +92,7 @@ This guide, with progressive disclosure: `mode:"toc"` (default) lists every file
 
 ## wicket_setup
 
-Shows, adds, fixes, re-defaults and removes connections, and works when none is configured. In Claude Code, `/wicket:setup` drives it with questions; elsewhere follow its description. The add path is `locate` (a BC address, email or domain) → `signin` (`browser`, `device_code` or `client_credentials`; call it again while it answers `pending`) → `environments` → `companies` → `save`, which tests the new connection with `whoami`. `status` checks each connection without prompting a sign-in and names its company, sign-in method and read-only setting; `/wicket:setup view` shows that and changes nothing. Confirm with the user before `remove`. A client secret never passes through it: the user stores it in the Keychain themselves.
+Shows, adds, fixes, re-defaults and removes connections, and works when none is configured. In Claude Code, `/wicket:setup` drives it with questions; elsewhere follow its description. The add path is `locate` (a BC address, email or domain) → `signin` (`browser`, `device_code` or `client_credentials`; call it again while it answers `pending`) → `environments` → `companies` (pass the address's `companyName` to get its `match`) → `save`, which tests the new connection with `whoami`. `status` checks each connection without prompting a sign-in and names its company, sign-in method and read-only setting; `/wicket:setup view` shows that and changes nothing. Confirm with the user before `remove`. A client secret never passes through it: the user stores it in the Keychain themselves.
 
 ## wicket_use
 

@@ -278,6 +278,98 @@ describe('wicket_setup', () => {
         expect(JSON.parse(readFileSync(file, 'utf8')).connections.a.description).toBe('My own label');
     });
 
+    test('companies with the company name from the address returns the match, whatever its case or Unicode form', async () => {
+        routeAppToken();
+        stub.route(new RegExp(`/v2\\.0/${TID}/Production/api/v2\\.0/companies$`), () =>
+            jsonResponse({ value: [{ id: COMPANY_A, name: 'CRONUS Österreich', displayName: '' }, { id: COMPANY_B, name: 'Other', displayName: '' }] }),
+        );
+        await start();
+        await setup({ action: 'signin', method: 'client_credentials', tenantId: TID, clientId: 'app-1', keychainService: 'wicket', keychainAccount: 'a' });
+        const res = toolJsonAs<{ value: unknown[]; match?: { id: string } }>(
+            await setup({ action: 'companies', environment: 'Production', companyName: 'cronus O\u0308sterreich' }),
+        );
+        expect(res.value).toHaveLength(2);
+        expect(res.match?.id).toBe(COMPANY_A);
+        const none = toolJsonAs<Record<string, unknown>>(await setup({ action: 'companies', environment: 'Production', companyName: 'Gone' }));
+        expect(none).not.toHaveProperty('match');
+    });
+
+    test('moveAsideBroken refuses a file that reads fine, and a missing one', async () => {
+        await start();
+        const missing = await setup({ action: 'moveAsideBroken' });
+        expect(toolIsError(missing)).toBe(true);
+        expect(toolText(missing)).toMatch(/nothing to move aside/);
+        process.env.WICKET_TEST_SECRET = 's';
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(file, JSON.stringify({ connections: { a: entry() } }));
+        const fine = await setup({ action: 'moveAsideBroken' });
+        expect(toolIsError(fine)).toBe(true);
+        expect(existsSync(file)).toBe(true);
+        writeFileSync(file, '{ not json');
+        const broken = toolJsonAs<{ movedTo: string }>(await setup({ action: 'moveAsideBroken' }));
+        expect(broken.movedTo).toContain('connections.json.broken-');
+        expect(existsSync(file)).toBe(false);
+    });
+
+    test('re-saving an app connection as a browser sign-in drops the old secret source', async () => {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(
+            file,
+            JSON.stringify({ connections: { a: entry({ keychainService: 'wicket', keychainAccount: 'a', readOnly: true }) } }),
+        );
+        stub.rpc(() => odata({}));
+        const log: Array<{ target: DelegatedTarget; silentOnly?: boolean }> = [];
+        await start({
+            setupSession: new SetupSession({ createCredential: instantCredential(log), waitMs: 20 }),
+            createCredential: async () => ({ getToken: async () => ({ token: 'tok' }), authenticationRecord: () => undefined }),
+            tokens: () => ({ getToken: async () => 'tok' }),
+        });
+        await setup({ action: 'signin', method: 'browser' });
+        const res = await setup({ action: 'save', name: 'a', environment: 'Production', companyId: COMPANY_A, replace: true });
+        expect(toolIsError(res)).toBe(false);
+        const saved = JSON.parse(readFileSync(file, 'utf8')).connections.a;
+        expect(saved).toMatchObject({ authMode: 'browser', readOnly: true });
+        expect(saved).not.toHaveProperty('keychainService');
+        expect(saved).not.toHaveProperty('keychainAccount');
+        expect(saved).not.toHaveProperty('secretEnv');
+    });
+
+    test('names that are object-prototype keys are refused and leave the file alone', async () => {
+        routeAppToken();
+        process.env.WICKET_TEST_SECRET = 's';
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(file, JSON.stringify({ connections: { a: entry() } }));
+        const before = readFileSync(file, 'utf8');
+        await start();
+        await setup({ action: 'signin', method: 'client_credentials', tenantId: TID, clientId: 'app-1', keychainService: 'wicket', keychainAccount: 'x' });
+        for (const name of ['__proto__', 'constructor', 'prototype']) {
+            const saved = await setup({ action: 'save', name, environment: 'Production', companyId: COMPANY_A });
+            expect(toolIsError(saved)).toBe(true);
+            expect(toolText(saved)).toMatch(/is invalid/);
+            const removed = await setup({ action: 'remove', name });
+            expect(toolIsError(removed)).toBe(true);
+            expect(toolIsError(await setup({ action: 'setDefault', name }))).toBe(true);
+        }
+        expect(readFileSync(file, 'utf8')).toBe(before);
+    });
+
+    test('a connection without a saved sign-in is healthy once this server has signed it in', async () => {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(
+            file,
+            JSON.stringify({ connections: { me: entry({ authMode: 'browser', secretEnv: undefined, persistTokenCache: false }) } }),
+        );
+        stub.rpc(() => odata({ userId: 'ME' }));
+        let signedIn = false;
+        await start({ tokens: () => ({ getToken: async () => 'tok', signedIn: () => signedIn }) });
+        const health = async () =>
+            toolJsonAs<{ connections: Array<{ health: { state: string } }> }>(await setup({ action: 'status' })).connections[0]!.health.state;
+        expect(await health()).toBe('signInNeeded');
+        expect(stub.requests).toHaveLength(0);
+        signedIn = true;
+        expect(await health()).toBe('ok');
+    });
+
     test('status runs no interactive sign-in', async () => {
         mkdirSync(join(file, '..'), { recursive: true });
         writeFileSync(

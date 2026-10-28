@@ -42581,6 +42581,7 @@ var ConnectionsFile = exports_external.object({
   connections: exports_external.record(exports_external.unknown())
 }).strict();
 var CONNECTION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+var RESERVED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 function assertCompanyAllowed(spec) {
   if (!spec.companies?.length)
     return;
@@ -42615,6 +42616,9 @@ function errorText(err) {
 function validateConnectionEntry(name4, raw) {
   if (!CONNECTION_NAME_RE.test(name4)) {
     throw new Error(`Connection name "${name4}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
+  }
+  if (RESERVED_NAMES.has(name4)) {
+    throw new Error(`Connection name "${name4}" is invalid (a reserved word; choose another name).`);
   }
   const result = ConnectionEntry.safeParse(raw);
   if (!result.success) {
@@ -42949,6 +42953,7 @@ class UserTokenProvider {
   unreported = null;
   onPrompt = () => {};
   waitMs;
+  hasToken = false;
   constructor(spec, options = {}) {
     this.spec = spec;
     this.options = options;
@@ -42956,6 +42961,9 @@ class UserTokenProvider {
   }
   get label() {
     return this.spec.authMode === "browser" ? "browser" : "device-code";
+  }
+  signedIn() {
+    return this.hasToken;
   }
   async getToken() {
     if (!this.flow && this.unreported) {
@@ -43032,6 +43040,7 @@ class UserTokenProvider {
     if (!token) {
       throw new Error(`Connection "${this.spec.name}": ${this.label} auth returned no token.`);
     }
+    this.hasToken = true;
     return token.token;
   }
 }
@@ -43053,10 +43062,10 @@ async function createDelegatedCredential(target, onPrompt, opts = {}) {
   });
   const needsPerson = (e) => e instanceof Error && e.name === "AuthenticationRequiredError";
   return {
-    async getToken(scope) {
+    async getToken(scope, options = {}) {
       if (record3) {
         try {
-          return await credential.getToken(scope);
+          return await credential.getToken(scope, options);
         } catch (e) {
           if (!needsPerson(e))
             throw e;
@@ -43066,13 +43075,13 @@ async function createDelegatedCredential(target, onPrompt, opts = {}) {
         throw new SignInNeededError(target.name);
       if (target.authMode === "browser")
         onPrompt({ kind: "browser" });
-      const fresh = await credential.authenticate(scope);
+      const fresh = await credential.authenticate(scope, options);
       if (fresh) {
         record3 = fresh;
         if (persist)
           writeAuthRecord(recordFile, identity.serializeAuthenticationRecord(fresh));
       }
-      return credential.getToken(scope);
+      return credential.getToken(scope, options);
     },
     authenticationRecord: () => record3 ? identity.serializeAuthenticationRecord(record3) : undefined
   };
@@ -43909,10 +43918,12 @@ function edit(change) {
 }
 function upsertConnection(name4, fields, opts) {
   edit((doc2) => {
-    const existing = doc2.connections[name4];
+    const existing = Object.hasOwn(doc2.connections, name4) ? doc2.connections[name4] : undefined;
     if (existing && !opts.replace)
       throw new Error(`connection "${name4}" exists`);
     const merged = { ...opts.defaults ?? {}, ...existing ?? {}, ...fields };
+    for (const key of opts.drop ?? [])
+      delete merged[key];
     opts.validate?.(name4, merged);
     doc2.connections[name4] = merged;
     if (opts.makeDefault)
@@ -43922,7 +43933,7 @@ function upsertConnection(name4, fields, opts) {
 function removeConnection(name4) {
   let defaultCleared = false;
   edit((doc2) => {
-    if (!(name4 in doc2.connections))
+    if (!Object.hasOwn(doc2.connections, name4))
       throw new Error(`connection "${name4}" is not in ${connectionsFile()}`);
     delete doc2.connections[name4];
     if (doc2.default === name4) {
@@ -43940,7 +43951,7 @@ function removeConnection(name4) {
 }
 function setDefaultConnection(name4) {
   edit((doc2) => {
-    if (!(name4 in doc2.connections))
+    if (!Object.hasOwn(doc2.connections, name4))
       throw new Error(`connection "${name4}" is not in ${connectionsFile()}`);
     doc2.default = name4;
   });
@@ -43963,8 +43974,9 @@ var REQUEST_TIMEOUT_MS = 30000;
 var SETUP_SESSION_NAME = ".setup-session";
 function parseBcAddress(text) {
   let url;
+  const trimmed = text.trim();
   try {
-    url = new URL(text.trim());
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
   } catch {
     return;
   }
@@ -44026,6 +44038,7 @@ async function locate(hint) {
   return result;
 }
 var PENDING_LIMIT_MS = 10 * 60000;
+var TOKEN_RENEW_MS = 5 * 60000;
 function claimsOf(token) {
   try {
     return JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
@@ -44044,12 +44057,17 @@ class SetupSession {
     this.waitMs = options.waitMs ?? 1e4;
     this.now = options.now ?? Date.now;
   }
+  drop() {
+    if (this.flow && !this.flow.settled)
+      this.flow.abort.abort();
+    this.flow = undefined;
+  }
   async signin(args) {
     const key = JSON.stringify([args.method, args.tenantId, args.clientId, args.keychainService, args.keychainAccount]);
     if (this.flow && (this.flow.key !== key || args.restart))
-      this.flow = undefined;
+      this.drop();
     if (this.flow && !this.flow.settled && this.now() - this.flow.startedAt > PENDING_LIMIT_MS) {
-      this.flow = undefined;
+      this.drop();
       return { state: "failed", message: "The sign-in was not finished within 10 minutes: sign-in timed out, start again." };
     }
     if (this.flow && this.flow.settled && "error" in this.flow.settled)
@@ -44106,11 +44124,13 @@ class SetupSession {
       prompted: new Promise((resolve) => {
         signalPrompt = resolve;
       }),
-      result: Promise.resolve({ error: undefined })
+      result: Promise.resolve({ error: undefined }),
+      abort: new AbortController
     };
     const acquire = async () => {
       if (target.method === "client_credentials") {
-        return new AppTokenProvider(this.appSpec(target)).getToken();
+        flow.app = new AppTokenProvider(this.appSpec(target));
+        return flow.app.getToken();
       }
       rmSync2(authRecordPath(SETUP_SESSION_NAME), { force: true });
       const delegated = {
@@ -44124,7 +44144,7 @@ class SetupSession {
         flow.prompt = prompt;
         signalPrompt();
       });
-      const token = await flow.credential.getToken(SCOPE2);
+      const token = await flow.credential.getToken(SCOPE2, { abortSignal: flow.abort.signal });
       if (!token)
         throw new Error("The sign-in returned no token.");
       return token.token;
@@ -44146,11 +44166,23 @@ class SetupSession {
       ...target.keychainAccount ? { keychainAccount: target.keychainAccount } : {}
     };
   }
-  token() {
-    const settled = this.flow?.settled;
-    if (!settled || !("token" in settled))
+  async token() {
+    const flow = this.flow;
+    const settled = flow?.settled;
+    if (!flow || !settled || !("token" in settled))
       throw new Error("Setup is not signed in: call signin first.");
-    return settled.token;
+    const exp = claimsOf(settled.token).exp;
+    if (typeof exp !== "number" || exp * 1000 - this.now() > TOKEN_RENEW_MS)
+      return settled.token;
+    let token;
+    if (flow.app)
+      token = await flow.app.getToken();
+    else
+      token = (await flow.credential?.getToken(SCOPE2))?.token;
+    if (!token)
+      throw new Error("The sign-in expired: sign in again (signin with restart).");
+    flow.settled = { token };
+    return token;
   }
   get target() {
     return this.flow?.target;
@@ -44186,6 +44218,30 @@ async function listCompanies(token, tenantId, environment) {
   const body = await getJson(`${BC_API}/v2.0/${encodeURIComponent(tenantId)}/${encodeURIComponent(environment)}/api/v2.0/companies`, token);
   return (body.value ?? []).map((c) => ({ id: String(c.id), name: String(c.name), displayName: String(c.displayName ?? "") }));
 }
+function matchCompany(companies, name4) {
+  const fold = (text) => text.trim().normalize("NFC").toLocaleLowerCase();
+  const wanted = fold(name4);
+  return companies.find((c) => fold(c.name) === wanted) ?? companies.find((c) => c.displayName && fold(c.displayName) === wanted);
+}
+var HEALTH_TIMEOUT_MS = 30000;
+
+class HealthTimeoutError extends Error {
+  constructor(ms) {
+    super(`Business Central did not answer within ${Math.round(ms / 1000)} s: check the network and try again.`);
+    this.name = "HealthTimeoutError";
+  }
+}
+async function within(work, ms) {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new HealthTimeoutError(ms)), ms);
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function statusOf(err) {
   const e = err;
   const status = e?.problem?.status ?? e?.status;
@@ -44198,15 +44254,25 @@ function messageOf(err) {
   return typeof problem?.detail === "string" ? problem.detail : String(err);
 }
 async function checkHealth(spec, whoami, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? HEALTH_TIMEOUT_MS;
   try {
-    if (isDelegated(spec.authMode)) {
+    if (isDelegated(spec.authMode) && !spec.persistTokenCache) {
+      if (!opts.signedInHere?.()) {
+        return {
+          state: "signInNeeded",
+          message: "This connection keeps no saved sign-in (persistTokenCache: false): the first Wicket call shows the sign-in prompt."
+        };
+      }
+    } else if (isDelegated(spec.authMode)) {
       const create = opts.createCredential ?? createDelegatedCredential;
       const credential = await create(spec, () => {}, { silentOnly: true });
-      await credential.getToken(SCOPE2);
+      await within(credential.getToken(SCOPE2), timeoutMs);
     } else {
       await resolveSecret(spec);
     }
   } catch (err) {
+    if (err instanceof HealthTimeoutError)
+      return { state: "unreachable", message: err.message };
     if (err instanceof SignInNeededError)
       return { state: "signInNeeded", message: "The saved sign-in is missing or expired: sign in again." };
     if (!isDelegated(spec.authMode)) {
@@ -44215,8 +44281,10 @@ async function checkHealth(spec, whoami, opts = {}) {
     return { state: "tokenRefused", message: explainAuthError(err) };
   }
   try {
-    return { state: "ok", message: "Connected.", identity: await whoami() };
+    return { state: "ok", message: "Connected.", identity: await within(whoami(), timeoutMs) };
   } catch (err) {
+    if (err instanceof HealthTimeoutError)
+      return { state: "unreachable", message: err.message };
     const status = statusOf(err);
     const type = err?.problem?.type;
     if (typeof type === "string" && type.endsWith("sign-in-required")) {
@@ -44273,7 +44341,7 @@ function explainAuthError(err) {
 }
 
 // src/index.ts
-var SERVER_VERSION = "2.4.1";
+var SERVER_VERSION = "2.4.2";
 var RPC_TIMEOUT_MS = 120000;
 var MUTATING_OPERATIONS = new Set(["insert", "modify", "delete", "invoke", "action"]);
 var UNMASK_AWARE_OPERATIONS = new Set(["query", "readBlob", "describe"]);
@@ -44315,6 +44383,9 @@ class WicketClient {
     this.baseUrl = (spec.baseUrl ?? `https://api.businesscentral.dynamics.com/v2.0/${spec.tenantId}/${spec.environment}`).replace(/\/+$/, "");
     this.origin = spec.origin ?? `mcp.wicket/${SERVER_VERSION}+${spec.name}`;
     this.companyId = spec.companyId;
+  }
+  signedIn() {
+    return this.tokens.signedIn?.() ?? false;
   }
   operationUrl(operation) {
     return `${this.baseUrl}/api/wicket/rpc/v1.0/` + `companies(${this.companyId})/wicketEndpoint(0)/Microsoft.NAV.${operation}`;
@@ -45127,7 +45198,8 @@ ${renderSkillToc(doc2)}`);
   });
   const setupSession = options.setupSession ?? new SetupSession;
   const healthOf = (spec) => checkHealth(spec, () => pool.get(spec.name).call("whoAmI", {}), {
-    ...options.createCredential ? { createCredential: options.createCredential } : {}
+    ...options.createCredential ? { createCredential: options.createCredential } : {},
+    signedInHere: () => pool.get(spec.name).signedIn()
   });
   const identityOf = (spec) => ({
     name: spec.name,
@@ -45159,7 +45231,7 @@ ${renderSkillToc(doc2)}`);
   };
   server.registerTool("wicket_setup", {
     title: "Set up Business Central connections",
-    description: "Add, fix, re-default or remove Wicket connections; use it when no connection is configured, " + "when a call fails with connection-unavailable or sign-in trouble, or when the user wants another " + "tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: " + "`status` (the file, any problem, each connection with a silent health check \u2014 never prompts); " + "`locate` {hint: a BC web address, an email or a domain} \u2192 tenantId and, from an address, " + "environment and companyName; `signin` {method: browser | device_code | client_credentials, " + "tenantId? (default organizations), clientId? (default: the Wicket default client), restart? " + "(start afresh: wrong account, closed window, expired code), " + "keychainService/keychainAccount for client_credentials} \u2192 pending with the prompt (call again " + "once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; " + "`companies` {environment}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes " + "the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: " + "confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable " + "connections.json (only on the user's yes). Add = locate \u2192 signin \u2192 environments \u2192 companies \u2192 " + "save. Secrets never pass through this tool: a client secret is read from the Keychain item.",
+    description: "Add, fix, re-default or remove Wicket connections; use it when no connection is configured, " + "when a call fails with connection-unavailable or sign-in trouble, or when the user wants another " + "tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: " + "`status` (the file, any problem, each connection with a silent health check \u2014 never prompts); " + "`locate` {hint: a BC web address, an email or a domain} \u2192 tenantId and, from an address, " + "environment and companyName; `signin` {method: browser | device_code | client_credentials, " + "tenantId? (default organizations), clientId? (default: the Wicket default client), restart? " + "(start afresh: wrong account, closed window, expired code), " + "keychainService/keychainAccount for client_credentials} \u2192 pending with the prompt (call again " + "once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; " + "`companies` {environment, companyName? (\u2192 `match`, the company of that name)}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes " + "the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: " + "confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable " + "connections.json (only on the user's yes). Add = locate \u2192 signin \u2192 environments \u2192 companies \u2192 " + "save. Secrets never pass through this tool: a client secret is read from the Keychain item.",
     inputSchema: {
       action: exports_external.enum(["status", "locate", "signin", "environments", "companies", "save", "remove", "setDefault", "moveAsideBroken"]),
       hint: exports_external.string().optional().describe("locate: a BC web address, an email or a domain."),
@@ -45171,7 +45243,7 @@ ${renderSkillToc(doc2)}`);
       keychainAccount: exports_external.string().optional().describe("signin (client_credentials): Keychain account of the secret, usually the connection name."),
       environment: exports_external.string().optional().describe("companies / save: the environment name."),
       companyId: exports_external.string().optional().describe("save: the company id from `companies`."),
-      companyName: exports_external.string().optional().describe("save: the company name, kept as the connection description when it has none."),
+      companyName: exports_external.string().optional().describe("companies: the name from locate, answered as `match`; save: the company name, kept as the connection description when it has none."),
       name: exports_external.string().optional().describe("save / remove / setDefault: the connection name."),
       makeDefault: exports_external.boolean().optional().describe("save: make it the default connection."),
       replace: exports_external.boolean().optional().describe("save: overwrite an existing connection of that name (fields not given are kept).")
@@ -45211,7 +45283,7 @@ ${renderSkillToc(doc2)}`);
             ...args.keychainAccount ? { keychainAccount: args.keychainAccount } : {}
           }));
         case "environments": {
-          const token = setupSession.token();
+          const token = await setupSession.token();
           try {
             return ok({ value: await listEnvironments(token) });
           } catch (err) {
@@ -45220,10 +45292,12 @@ ${renderSkillToc(doc2)}`);
         }
         case "companies": {
           const target = setupSession.target;
-          const token = setupSession.token();
+          const token = await setupSession.token();
           const environment = need(args.environment, "environment");
           try {
-            return ok({ value: await listCompanies(token, target.tenantId, environment) });
+            const companies = await listCompanies(token, target.tenantId, environment);
+            const match = args.companyName ? matchCompany(companies, args.companyName) : undefined;
+            return ok({ value: companies, ...match ? { match } : {} });
           } catch (err) {
             return fail(new Error(explainListError(err, "companies", environment)));
           }
@@ -45233,7 +45307,7 @@ ${renderSkillToc(doc2)}`);
           refuseEnv(name4);
           const target = setupSession.target;
           try {
-            setupSession.token();
+            await setupSession.token();
           } catch {
             throw new Error("Not signed in: sign in first (action signin), then save.");
           }
@@ -45249,6 +45323,7 @@ ${renderSkillToc(doc2)}`);
             replace: args.replace ?? false,
             makeDefault: args.makeDefault ?? false,
             ...args.companyName ? { defaults: { description: `${args.companyName} \xB7 ${fields.environment}` } } : {},
+            drop: target.method === "client_credentials" ? ["secretEnv", "clientSecret"] : ["keychainService", "keychainAccount", "secretEnv", "clientSecret"],
             validate: (n, merged) => void validateConnectionEntry(n, merged)
           });
           const record3 = setupSession.authenticationRecord();
@@ -45282,6 +45357,10 @@ ${renderSkillToc(doc2)}`);
           return ok({ default: name4, current: registry2.current() });
         }
         case "moveAsideBroken": {
+          registry2.reload();
+          if (registry2.problem?.kind !== "invalid") {
+            throw new Error(`${connectionsFile()} can be read (or does not exist): nothing to move aside.`);
+          }
           const movedTo = moveAsideBroken();
           registry2.reload();
           return ok({ movedTo });

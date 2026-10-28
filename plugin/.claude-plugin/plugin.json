@@ -1,7 +1,7 @@
 {
   "name": "wicket",
   "displayName": "Wicket",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "Work with Microsoft Dynamics 365 Business Central through Wicket: the wicket_* MCP tools, the Wicket usage skill, and /wicket:setup, /wicket:orient and /wicket:inventory.",
   "author": {
     "name": "Dave The Wicketkeeper"

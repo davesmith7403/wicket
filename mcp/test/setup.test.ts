@@ -63,6 +63,15 @@ describe('parseBcAddress / locate', () => {
         expect(parseBcAddress('not a url')).toBeUndefined();
     });
 
+    test('reads an address pasted without https://', () => {
+        expect(parseBcAddress(`businesscentral.dynamics.com/${TID}/Production?company=CRONUS`)).toEqual({
+            tenant: TID,
+            environment: 'Production',
+            companyName: 'CRONUS',
+        });
+        expect(parseBcAddress('contoso.com')).toBeUndefined();
+    });
+
     test('locate resolves an email domain to the issuer GUID and reports what it could not tell', async () => {
         stub.route(/login\.microsoftonline\.com\/contoso\.com\/v2\.0\/\.well-known\/openid-configuration/, () =>
             jsonResponse({ issuer: `https://login.microsoftonline.com/${TID}/v2.0` }),
@@ -90,11 +99,13 @@ describe('SetupSession', () => {
         let complete: ((token: string) => void) | undefined;
         let fail: ((e: Error) => void) | undefined;
         const created: DelegatedTarget[] = [];
+        const signals: Array<AbortSignal | undefined> = [];
         const createCredential = async (target: DelegatedTarget, onPrompt: (p: SignInPrompt) => void): Promise<DelegatedCredential> => {
             created.push(target);
             return {
-                getToken: () =>
+                getToken: (_scope: string, options?: { abortSignal?: AbortSignal }) =>
                     new Promise((resolve, reject) => {
+                        signals.push(options?.abortSignal);
                         complete = (token) => resolve({ token });
                         fail = reject;
                         queueMicrotask(() =>
@@ -108,7 +119,7 @@ describe('SetupSession', () => {
                 authenticationRecord: () => '{"username":"me@contoso.com"}',
             };
         };
-        return { createCredential, created, signIn: (t: string) => complete!(t), fail: (e: Error) => fail!(e) };
+        return { createCredential, created, signals, signIn: (t: string) => complete!(t), fail: (e: Error) => fail!(e) };
     }
 
     test('signin returns pending with the device code, then signedIn with upn and tid', async () => {
@@ -122,7 +133,7 @@ describe('SetupSession', () => {
         expect(cred.created[0]).toMatchObject({ tenantId: 'organizations', clientId: '1950a258-227b-4e31-a9cf-717495945fc2' });
         cred.signIn(jwt({ upn: 'me@contoso.com', tid: TID }));
         expect(await session.signin({ method: 'device_code' })).toEqual({ state: 'signedIn', upn: 'me@contoso.com', tenantId: TID });
-        expect(session.token()).toContain('.');
+        expect(await session.token()).toContain('.');
         expect(session.target).toMatchObject({ method: 'device_code', tenantId: TID });
         expect(session.authenticationRecord()).toContain('me@contoso.com');
         expect(cred.created).toHaveLength(1);
@@ -135,7 +146,7 @@ describe('SetupSession', () => {
         const browser = await session.signin({ method: 'browser', tenantId: TID });
         expect(browser).toEqual({ state: 'pending', prompt: { kind: 'browser' } });
         expect(cred.created.map((t) => t.authMode)).toEqual(['device_code', 'browser']);
-        expect(() => session.token()).toThrow(/not signed in/);
+        await expect(session.token()).rejects.toThrow(/not signed in/);
     });
 
     test('signin with restart drops a finished session and signs in afresh (the wrong account)', async () => {
@@ -156,6 +167,41 @@ describe('SetupSession', () => {
         await session.signin({ method: 'browser' });
         expect((await session.signin({ method: 'browser', restart: true })).state).toBe('pending');
         expect(cred.created).toHaveLength(2);
+    });
+
+    test('a replaced, restarted or timed-out sign-in is aborted, so it stops polling', async () => {
+        const cred = scripted();
+        let now = 1_000_000;
+        const session = new SetupSession({ createCredential: cred.createCredential, waitMs: 20, now: () => now });
+        await session.signin({ method: 'device_code' });
+        await session.signin({ method: 'browser' });
+        expect(cred.signals[0]?.aborted).toBe(true);
+        await session.signin({ method: 'browser', restart: true });
+        expect(cred.signals[1]?.aborted).toBe(true);
+        now += 10 * 60_000 + 1;
+        await session.signin({ method: 'browser' });
+        expect(cred.signals[2]?.aborted).toBe(true);
+    });
+
+    test('token() refreshes a token that is about to expire, silently through the same credential', async () => {
+        let now = 1_000_000_000;
+        let calls = 0;
+        const createCredential = async (): Promise<DelegatedCredential> => ({
+            getToken: async () => {
+                calls++;
+                // The first token expires in two minutes; the refreshed one in an hour.
+                const exp = Math.floor(now / 1000) + (calls === 1 ? 120 : 3600);
+                return { token: jwt({ upn: 'me@contoso.com', tid: TID, exp, n: calls }) };
+            },
+            authenticationRecord: () => undefined,
+        });
+        const session = new SetupSession({ createCredential, waitMs: 20, now: () => now });
+        expect((await session.signin({ method: 'browser' })).state).toBe('signedIn');
+        const fresh = await session.token();
+        expect(JSON.parse(Buffer.from(fresh.split('.')[1]!, 'base64url').toString()).n).toBe(2);
+        // Still valid: no new request.
+        await session.token();
+        expect(calls).toBe(2);
     });
 
     test('a pending session older than 10 minutes fails with "start again"', async () => {
@@ -233,6 +279,11 @@ describe('listing', () => {
         await expect(listEnvironments('tok')).rejects.toMatchObject({ status: 401 });
     });
 
+    test('matchCompany matches a name typed in another Unicode form (NFD from a pasted address)', () => {
+        const companies = [{ id: '1', name: 'CRONUS Österreich', displayName: '' }];
+        expect(matchCompany(companies, 'CRONUS O\u0308sterreich')?.id).toBe('1');
+    });
+
     test('matchCompany is case-insensitive and falls back to displayName', () => {
         const companies = [
             { id: '1', name: 'CRONUS Österreich', displayName: '' },
@@ -256,7 +307,7 @@ describe('checkHealth', () => {
         const seen: Array<{ silentOnly?: boolean }> = [];
         let whoamiCalls = 0;
         const health = await checkHealth(
-            spec({ name: 'me', authMode: 'browser' }),
+            spec({ name: 'me', authMode: 'browser', persistTokenCache: true }),
             async () => {
                 whoamiCalls++;
                 return {};
@@ -273,8 +324,31 @@ describe('checkHealth', () => {
         expect(whoamiCalls).toBe(0);
     });
 
+    test('a whoami that does not answer is unreachable after the health timeout, not the 120 s call timeout', async () => {
+        process.env.WICKET_TEST_SECRET = 's';
+        const started = Date.now();
+        const health = await checkHealth(spec(), () => new Promise(() => {}), { timeoutMs: 30 });
+        expect(health.state).toBe('unreachable');
+        expect(health.message).toMatch(/did not answer/);
+        expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    test('a connection without a saved sign-in (persistTokenCache: false) is ok when this server is signed in', async () => {
+        let created = 0;
+        const target = spec({ name: 'me', authMode: 'browser', persistTokenCache: false });
+        const create = async () => {
+            created++;
+            return silentNeeded();
+        };
+        const signedIn = await checkHealth(target, async () => ({ userName: 'ME' }), { createCredential: create, signedInHere: () => true });
+        expect(signedIn.state).toBe('ok');
+        const notYet = await checkHealth(target, async () => ({}), { createCredential: create, signedInHere: () => false });
+        expect(notYet).toMatchObject({ state: 'signInNeeded', message: expect.stringMatching(/keeps no saved sign-in/) });
+        expect(created).toBe(0);
+    });
+
     test('reports ok with the identity whoami returns', async () => {
-        const health = await checkHealth(spec({ name: 'me', authMode: 'browser' }), async () => ({ userName: 'ME' }), {
+        const health = await checkHealth(spec({ name: 'me', authMode: 'browser', persistTokenCache: true }), async () => ({ userName: 'ME' }), {
             createCredential: async () => ({ getToken: async () => ({ token: 't' }), authenticationRecord: () => undefined }),
         });
         expect(health).toMatchObject({ state: 'ok', identity: { userName: 'ME' } });

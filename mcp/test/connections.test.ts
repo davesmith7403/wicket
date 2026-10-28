@@ -706,6 +706,17 @@ describe('UserTokenProvider', () => {
         expect(cred.state.created).toBe(1);
     });
 
+    test('signedIn is false until a token arrives, then true', async () => {
+        const cred = fakeCredential('prompt');
+        const provider = new UserTokenProvider(spec({ authMode: 'device_code' }), { createCredential: cred.createCredential, waitMs: 20 });
+        expect(provider.signedIn()).toBe(false);
+        await expect(provider.getToken()).rejects.toThrow(/sign in/);
+        expect(provider.signedIn()).toBe(false);
+        cred.signIn('user-tok');
+        expect(await provider.getToken()).toBe('user-tok');
+        expect(provider.signedIn()).toBe(true);
+    });
+
     test('a pending sign-in fails fast with the URL + code, keeps running, and the retry gets the token', async () => {
         const cred = fakeCredential('prompt');
         const provider = new UserTokenProvider(spec({ name: 'me', authMode: 'device_code' }), {

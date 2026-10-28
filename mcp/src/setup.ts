@@ -41,8 +41,10 @@ export const SETUP_SESSION_NAME = '.setup-session';
  */
 export function parseBcAddress(text: string): { tenant?: string; environment?: string; companyName?: string } | undefined {
     let url: URL;
+    const trimmed = text.trim();
     try {
-        url = new URL(text.trim());
+        // An address copied from the address bar often loses its https://.
+        url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
     } catch {
         return undefined;
     }
@@ -149,6 +151,9 @@ export interface SetupSessionOptions {
 /** A sign-in nobody finishes (closed tab, unused code) is abandoned after this long. */
 const PENDING_LIMIT_MS = 10 * 60_000;
 
+/** Renew the setup token when it has less than this left. */
+const TOKEN_RENEW_MS = 5 * 60_000;
+
 interface Flow {
     key: string;
     startedAt: number;
@@ -158,6 +163,9 @@ interface Flow {
     result: Promise<{ token: string } | { error: unknown }>;
     settled?: { token: string } | { error: unknown };
     credential?: DelegatedCredential;
+    app?: AppTokenProvider;
+    /** Stops an abandoned sign-in polling Entra (or holding the browser redirect port). */
+    abort: AbortController;
 }
 
 function claimsOf(token: string): Record<string, unknown> {
@@ -185,11 +193,17 @@ export class SetupSession {
         this.now = options.now ?? Date.now;
     }
 
+    /** Drop the current sign-in; one still waiting on the person is aborted. */
+    private drop(): void {
+        if (this.flow && !this.flow.settled) this.flow.abort.abort();
+        this.flow = undefined;
+    }
+
     async signin(args: SigninArgs): Promise<SigninState> {
         const key = JSON.stringify([args.method, args.tenantId, args.clientId, args.keychainService, args.keychainAccount]);
-        if (this.flow && (this.flow.key !== key || args.restart)) this.flow = undefined;
+        if (this.flow && (this.flow.key !== key || args.restart)) this.drop();
         if (this.flow && !this.flow.settled && this.now() - this.flow.startedAt > PENDING_LIMIT_MS) {
-            this.flow = undefined;
+            this.drop();
             return { state: 'failed', message: 'The sign-in was not finished within 10 minutes: sign-in timed out, start again.' };
         }
         if (this.flow && this.flow.settled && 'error' in this.flow.settled) this.flow = undefined;
@@ -246,10 +260,12 @@ export class SetupSession {
                 signalPrompt = resolve;
             }),
             result: Promise.resolve({ error: undefined }),
+            abort: new AbortController(),
         };
         const acquire = async (): Promise<string> => {
             if (target.method === 'client_credentials') {
-                return new AppTokenProvider(this.appSpec(target)).getToken();
+                flow.app = new AppTokenProvider(this.appSpec(target));
+                return flow.app.getToken();
             }
             // Always a fresh sign-in: a record left by an earlier setup would sign the old account in silently.
             rmSync(authRecordPath(SETUP_SESSION_NAME), { force: true });
@@ -264,7 +280,7 @@ export class SetupSession {
                 flow.prompt = prompt;
                 signalPrompt();
             });
-            const token = await flow.credential.getToken(SCOPE);
+            const token = await flow.credential.getToken(SCOPE, { abortSignal: flow.abort.signal });
             if (!token) throw new Error('The sign-in returned no token.');
             return token.token;
         };
@@ -290,11 +306,22 @@ export class SetupSession {
         };
     }
 
-    /** The signed-in token; throws when the session has not signed in. */
-    token(): string {
-        const settled = this.flow?.settled;
-        if (!settled || !('token' in settled)) throw new Error('Setup is not signed in: call signin first.');
-        return settled.token;
+    /**
+     * The signed-in token, renewed silently when it expires within five minutes (setup can sit idle
+     * past a token's hour while the person decides); throws when the session has not signed in.
+     */
+    async token(): Promise<string> {
+        const flow = this.flow;
+        const settled = flow?.settled;
+        if (!flow || !settled || !('token' in settled)) throw new Error('Setup is not signed in: call signin first.');
+        const exp = claimsOf(settled.token).exp;
+        if (typeof exp !== 'number' || exp * 1000 - this.now() > TOKEN_RENEW_MS) return settled.token;
+        let token: string | undefined;
+        if (flow.app) token = await flow.app.getToken();
+        else token = (await flow.credential?.getToken(SCOPE))?.token;
+        if (!token) throw new Error('The sign-in expired: sign in again (signin with restart).');
+        flow.settled = { token };
+        return token;
     }
 
     get target(): SetupTarget | undefined {
@@ -349,12 +376,14 @@ export async function listCompanies(
     return (body.value ?? []).map((c) => ({ id: String(c.id), name: String(c.name), displayName: String(c.displayName ?? '') }));
 }
 
-/** The company called `name`, by name then display name, ignoring case. */
+/** The company called `name`, by name then display name, ignoring case and Unicode form. */
 export function matchCompany<C extends { name: string; displayName: string }>(companies: C[], name: string): C | undefined {
-    const wanted = name.trim().toLocaleLowerCase();
+    // NFC: a name decoded from an address may spell Ö as O + combining diaeresis.
+    const fold = (text: string) => text.trim().normalize('NFC').toLocaleLowerCase();
+    const wanted = fold(name);
     return (
-        companies.find((c) => c.name.toLocaleLowerCase() === wanted) ??
-        companies.find((c) => c.displayName && c.displayName.toLocaleLowerCase() === wanted)
+        companies.find((c) => fold(c.name) === wanted) ??
+        companies.find((c) => c.displayName && fold(c.displayName) === wanted)
     );
 }
 
@@ -368,6 +397,29 @@ export interface Health {
     state: HealthState;
     message: string;
     identity?: unknown;
+}
+
+/** A health check waits this long, not a call's 120 s: one dead environment must not stall the status of all. */
+const HEALTH_TIMEOUT_MS = 30_000;
+
+class HealthTimeoutError extends Error {
+    constructor(ms: number) {
+        super(`Business Central did not answer within ${Math.round(ms / 1000)} s: check the network and try again.`);
+        this.name = 'HealthTimeoutError';
+    }
+}
+
+/** `work`, or a HealthTimeoutError once `ms` pass; the work itself runs on to its own timeout. */
+async function within<T>(work: Promise<T>, ms: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new HealthTimeoutError(ms)), ms);
+    });
+    try {
+        return await Promise.race([work, expired]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function statusOf(err: unknown): number | undefined {
@@ -389,17 +441,32 @@ function messageOf(err: unknown): string {
 export async function checkHealth(
     spec: ConnectionSpec,
     whoami: () => Promise<unknown>,
-    opts: { createCredential?: CreateCredential } = {},
+    opts: {
+        createCredential?: CreateCredential;
+        /** Whether this server already holds a sign-in for the connection (the only one a persistTokenCache: false connection has). */
+        signedInHere?: () => boolean;
+        timeoutMs?: number;
+    } = {},
 ): Promise<Health> {
+    const timeoutMs = opts.timeoutMs ?? HEALTH_TIMEOUT_MS;
     try {
-        if (isDelegated(spec.authMode)) {
+        if (isDelegated(spec.authMode) && !spec.persistTokenCache) {
+            // Nothing saved to probe: only this server's own sign-in counts, and whoami must not prompt.
+            if (!opts.signedInHere?.()) {
+                return {
+                    state: 'signInNeeded',
+                    message: 'This connection keeps no saved sign-in (persistTokenCache: false): the first Wicket call shows the sign-in prompt.',
+                };
+            }
+        } else if (isDelegated(spec.authMode)) {
             const create = opts.createCredential ?? createDelegatedCredential;
             const credential = await create(spec as DelegatedTarget, () => {}, { silentOnly: true });
-            await credential.getToken(SCOPE);
+            await within(credential.getToken(SCOPE), timeoutMs);
         } else {
             await resolveSecret(spec);
         }
     } catch (err) {
+        if (err instanceof HealthTimeoutError) return { state: 'unreachable', message: err.message };
         if (err instanceof SignInNeededError) return { state: 'signInNeeded', message: 'The saved sign-in is missing or expired: sign in again.' };
         if (!isDelegated(spec.authMode)) {
             return { state: 'secretMissing', message: 'The client secret is not where the connection says (Keychain item or variable): store it again.' };
@@ -407,8 +474,9 @@ export async function checkHealth(
         return { state: 'tokenRefused', message: explainAuthError(err) };
     }
     try {
-        return { state: 'ok', message: 'Connected.', identity: await whoami() };
+        return { state: 'ok', message: 'Connected.', identity: await within(whoami(), timeoutMs) };
     } catch (err) {
+        if (err instanceof HealthTimeoutError) return { state: 'unreachable', message: err.message };
         const status = statusOf(err);
         const type = (err as { problem?: { type?: unknown } } | null)?.problem?.type;
         if (typeof type === 'string' && type.endsWith('sign-in-required')) {

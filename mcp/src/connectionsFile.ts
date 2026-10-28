@@ -71,13 +71,16 @@ export function upsertConnection(
         makeDefault?: boolean;
         /** Fields written only when the entry does not have them yet (a description the user may have changed). */
         defaults?: Record<string, unknown>;
+        /** Keys removed from the kept entry (a secret source the new sign-in no longer uses). */
+        drop?: readonly string[];
         validate?: (name: string, merged: Record<string, unknown>) => void;
     },
 ): void {
     edit((doc) => {
-        const existing = doc.connections[name];
+        const existing = Object.hasOwn(doc.connections, name) ? doc.connections[name] : undefined;
         if (existing && !opts.replace) throw new Error(`connection "${name}" exists`);
-        const merged = { ...(opts.defaults ?? {}), ...(existing ?? {}), ...fields };
+        const merged: Record<string, unknown> = { ...(opts.defaults ?? {}), ...(existing ?? {}), ...fields };
+        for (const key of opts.drop ?? []) delete merged[key];
         // Check the entry as it will be written, kept fields included (a companies allowlist, say).
         opts.validate?.(name, merged);
         doc.connections[name] = merged;
@@ -94,7 +97,7 @@ export function upsertConnection(
 export function removeConnection(name: string): { defaultCleared: boolean } {
     let defaultCleared = false;
     edit((doc) => {
-        if (!(name in doc.connections)) throw new Error(`connection "${name}" is not in ${connectionsFile()}`);
+        if (!Object.hasOwn(doc.connections, name)) throw new Error(`connection "${name}" is not in ${connectionsFile()}`);
         delete doc.connections[name];
         if (doc.default === name) {
             const left = Object.keys(doc.connections);
@@ -109,7 +112,7 @@ export function removeConnection(name: string): { defaultCleared: boolean } {
 
 export function setDefaultConnection(name: string): void {
     edit((doc) => {
-        if (!(name in doc.connections)) throw new Error(`connection "${name}" is not in ${connectionsFile()}`);
+        if (!Object.hasOwn(doc.connections, name)) throw new Error(`connection "${name}" is not in ${connectionsFile()}`);
         doc.default = name;
     });
 }
