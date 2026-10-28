@@ -375,7 +375,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.0+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.1+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -433,7 +433,8 @@ In Claude Code with the plugin installed, run **`/wicket:setup`**: it asks how y
 device code, or an app with a client secret), finds the tenant from a pasted BC address or an
 email, lists the environments and companies to pick from, saves the connection to
 `~/.config/wicket/connections.json` and tests it, all without a GUID typed by hand or a restart. The
-same command fixes a connection that fails, changes the default and removes connections. It drives
+same command shows what is configured (`/wicket:setup view`), fixes a connection that fails, changes the
+default and removes connections. It drives
 the `wicket_setup` tool, which any MCP host can call directly. The server starts even with no
 connection configured; every tool then answers `503 connection-unavailable` naming `/wicket:setup`.
 

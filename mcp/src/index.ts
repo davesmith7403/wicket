@@ -36,6 +36,7 @@ import {
     ConnectionRegistry,
     ConnectionUnavailableError,
     SignInRequiredError,
+    DEFAULT_PUBLIC_CLIENT_ID,
     authRecordPath,
     connectionsFile,
     createDelegatedCredential,
@@ -84,7 +85,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.4.0';
+export const SERVER_VERSION = '2.4.1';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -1975,7 +1976,16 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
         companyId: spec.companyId,
         ...(spec.keychainService ? { keychainService: spec.keychainService, keychainAccount: spec.keychainAccount } : {}),
         ...(spec.secretEnv ? { secretEnv: spec.secretEnv } : {}),
+        readOnly: spec.readOnly,
+        usesDefaultClient: spec.clientId === DEFAULT_PUBLIC_CLIENT_ID,
+        ...(spec.description ? { description: spec.description } : {}),
     });
+    /** The company name whoami reported, when the health check reached Wicket. */
+    const companyOf = (health: { identity?: unknown }): string | undefined => {
+        const identity = health.identity as { value?: { company?: unknown }; company?: unknown } | undefined;
+        const company = identity?.value?.company ?? identity?.company;
+        return typeof company === 'string' && company ? company : undefined;
+    };
     const refuseEnv = (name: string) => {
         if (registry.sourceOf(name) === 'env') {
             throw new Error(
@@ -2004,7 +2014,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 '(start afresh: wrong account, closed window, expired code), ' +
                 'keychainService/keychainAccount for client_credentials} → pending with the prompt (call again ' +
                 'once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; ' +
-                '`companies` {environment}; `save` {name, environment, companyId, makeDefault?, replace?} writes ' +
+                '`companies` {environment}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes ' +
                 'the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: ' +
                 'confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable ' +
                 'connections.json (only on the user\'s yes). Add = locate → signin → environments → companies → ' +
@@ -2023,6 +2033,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 keychainAccount: z.string().optional().describe('signin (client_credentials): Keychain account of the secret, usually the connection name.'),
                 environment: z.string().optional().describe('companies / save: the environment name.'),
                 companyId: z.string().optional().describe('save: the company id from `companies`.'),
+                companyName: z.string().optional().describe('save: the company name, kept as the connection description when it has none.'),
                 name: z.string().optional().describe('save / remove / setDefault: the connection name.'),
                 makeDefault: z.boolean().optional().describe('save: make it the default connection.'),
                 replace: z.boolean().optional().describe('save: overwrite an existing connection of that name (fields not given are kept).'),
@@ -2034,12 +2045,17 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 switch (args.action) {
                     case 'status': {
                         const connections = await Promise.all(
-                            registry.list().map(async (c) => ({
-                                ...identityOf(registry.resolve(c.name)),
-                                source: registry.sourceOf(c.name),
-                                isDefault: c.isDefault,
-                                health: await healthOf(registry.resolve(c.name)),
-                            })),
+                            registry.list().map(async (c) => {
+                                const health = await healthOf(registry.resolve(c.name));
+                                const company = companyOf(health);
+                                return {
+                                    ...identityOf(registry.resolve(c.name)),
+                                    ...(company ? { company } : {}),
+                                    source: registry.sourceOf(c.name),
+                                    isDefault: c.isDefault,
+                                    health,
+                                };
+                            }),
                         );
                         return ok({
                             file: connectionsFile(),
@@ -2103,6 +2119,8 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         upsertConnection(name, fields, {
                             replace: args.replace ?? false,
                             makeDefault: args.makeDefault ?? false,
+                            // A label for listings that does not depend on reaching BC; never over a user's own.
+                            ...(args.companyName ? { defaults: { description: `${args.companyName} · ${fields.environment}` } } : {}),
                             validate: (n, merged) => void validateConnectionEntry(n, merged),
                         });
                         const record = setupSession.authenticationRecord();

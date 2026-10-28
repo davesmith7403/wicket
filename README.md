@@ -42,8 +42,8 @@ The repository root is also the plugin's marketplace.
 Then run **`/wicket:setup`**. It asks how you sign in (in the browser, with a device code, or as an
 app with a client secret), works out the tenant from a pasted Business Central address or your work
 email, and lets you pick the environment and company from lists: no IDs to look up. It saves the
-connection, tests it, and the tools work at once. Run it again to add another tenant or company, fix a
-connection that fails, or change the default. Connections stay on your machine in `~/.config/wicket/`;
+connection, tests it, and the tools work at once. Run it again to see what is configured
+(`/wicket:setup view`), add another tenant or company, fix a connection that fails, or change the default. Connections stay on your machine in `~/.config/wicket/`;
 a client secret goes into the system keychain through a command you run yourself, never through the
 chat. To write the file by hand instead, see [mcp/README.md](mcp/README.md#connections).
 

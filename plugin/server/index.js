@@ -43912,7 +43912,7 @@ function upsertConnection(name4, fields, opts) {
     const existing = doc2.connections[name4];
     if (existing && !opts.replace)
       throw new Error(`connection "${name4}" exists`);
-    const merged = { ...existing ?? {}, ...fields };
+    const merged = { ...opts.defaults ?? {}, ...existing ?? {}, ...fields };
     opts.validate?.(name4, merged);
     doc2.connections[name4] = merged;
     if (opts.makeDefault)
@@ -44273,7 +44273,7 @@ function explainAuthError(err) {
 }
 
 // src/index.ts
-var SERVER_VERSION = "2.4.0";
+var SERVER_VERSION = "2.4.1";
 var RPC_TIMEOUT_MS = 120000;
 var MUTATING_OPERATIONS = new Set(["insert", "modify", "delete", "invoke", "action"]);
 var UNMASK_AWARE_OPERATIONS = new Set(["query", "readBlob", "describe"]);
@@ -45137,8 +45137,16 @@ ${renderSkillToc(doc2)}`);
     environment: spec.environment,
     companyId: spec.companyId,
     ...spec.keychainService ? { keychainService: spec.keychainService, keychainAccount: spec.keychainAccount } : {},
-    ...spec.secretEnv ? { secretEnv: spec.secretEnv } : {}
+    ...spec.secretEnv ? { secretEnv: spec.secretEnv } : {},
+    readOnly: spec.readOnly,
+    usesDefaultClient: spec.clientId === DEFAULT_PUBLIC_CLIENT_ID,
+    ...spec.description ? { description: spec.description } : {}
   });
+  const companyOf = (health) => {
+    const identity = health.identity;
+    const company = identity?.value?.company ?? identity?.company;
+    return typeof company === "string" && company ? company : undefined;
+  };
   const refuseEnv = (name4) => {
     if (registry2.sourceOf(name4) === "env") {
       throw new Error(`Connection "${name4}" comes from environment variables (BC_TENANT_ID etc.): change those, ` + "or save a connection under another name.");
@@ -45151,7 +45159,7 @@ ${renderSkillToc(doc2)}`);
   };
   server.registerTool("wicket_setup", {
     title: "Set up Business Central connections",
-    description: "Add, fix, re-default or remove Wicket connections; use it when no connection is configured, " + "when a call fails with connection-unavailable or sign-in trouble, or when the user wants another " + "tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: " + "`status` (the file, any problem, each connection with a silent health check \u2014 never prompts); " + "`locate` {hint: a BC web address, an email or a domain} \u2192 tenantId and, from an address, " + "environment and companyName; `signin` {method: browser | device_code | client_credentials, " + "tenantId? (default organizations), clientId? (default: the Wicket default client), restart? " + "(start afresh: wrong account, closed window, expired code), " + "keychainService/keychainAccount for client_credentials} \u2192 pending with the prompt (call again " + "once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; " + "`companies` {environment}; `save` {name, environment, companyId, makeDefault?, replace?} writes " + "the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: " + "confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable " + "connections.json (only on the user's yes). Add = locate \u2192 signin \u2192 environments \u2192 companies \u2192 " + "save. Secrets never pass through this tool: a client secret is read from the Keychain item.",
+    description: "Add, fix, re-default or remove Wicket connections; use it when no connection is configured, " + "when a call fails with connection-unavailable or sign-in trouble, or when the user wants another " + "tenant or company. In Claude Code the /wicket:setup command drives it with questions. Actions: " + "`status` (the file, any problem, each connection with a silent health check \u2014 never prompts); " + "`locate` {hint: a BC web address, an email or a domain} \u2192 tenantId and, from an address, " + "environment and companyName; `signin` {method: browser | device_code | client_credentials, " + "tenantId? (default organizations), clientId? (default: the Wicket default client), restart? " + "(start afresh: wrong account, closed window, expired code), " + "keychainService/keychainAccount for client_credentials} \u2192 pending with the prompt (call again " + "once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; " + "`companies` {environment}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes " + "the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: " + "confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable " + "connections.json (only on the user's yes). Add = locate \u2192 signin \u2192 environments \u2192 companies \u2192 " + "save. Secrets never pass through this tool: a client secret is read from the Keychain item.",
     inputSchema: {
       action: exports_external.enum(["status", "locate", "signin", "environments", "companies", "save", "remove", "setDefault", "moveAsideBroken"]),
       hint: exports_external.string().optional().describe("locate: a BC web address, an email or a domain."),
@@ -45163,6 +45171,7 @@ ${renderSkillToc(doc2)}`);
       keychainAccount: exports_external.string().optional().describe("signin (client_credentials): Keychain account of the secret, usually the connection name."),
       environment: exports_external.string().optional().describe("companies / save: the environment name."),
       companyId: exports_external.string().optional().describe("save: the company id from `companies`."),
+      companyName: exports_external.string().optional().describe("save: the company name, kept as the connection description when it has none."),
       name: exports_external.string().optional().describe("save / remove / setDefault: the connection name."),
       makeDefault: exports_external.boolean().optional().describe("save: make it the default connection."),
       replace: exports_external.boolean().optional().describe("save: overwrite an existing connection of that name (fields not given are kept).")
@@ -45172,12 +45181,17 @@ ${renderSkillToc(doc2)}`);
     try {
       switch (args.action) {
         case "status": {
-          const connections = await Promise.all(registry2.list().map(async (c) => ({
-            ...identityOf(registry2.resolve(c.name)),
-            source: registry2.sourceOf(c.name),
-            isDefault: c.isDefault,
-            health: await healthOf(registry2.resolve(c.name))
-          })));
+          const connections = await Promise.all(registry2.list().map(async (c) => {
+            const health = await healthOf(registry2.resolve(c.name));
+            const company = companyOf(health);
+            return {
+              ...identityOf(registry2.resolve(c.name)),
+              ...company ? { company } : {},
+              source: registry2.sourceOf(c.name),
+              isDefault: c.isDefault,
+              health
+            };
+          }));
           return ok({
             file: connectionsFile(),
             ...registry2.problem ? { problem: registry2.problem } : {},
@@ -45234,6 +45248,7 @@ ${renderSkillToc(doc2)}`);
           upsertConnection(name4, fields, {
             replace: args.replace ?? false,
             makeDefault: args.makeDefault ?? false,
+            ...args.companyName ? { defaults: { description: `${args.companyName} \xB7 ${fields.environment}` } } : {},
             validate: (n, merged) => void validateConnectionEntry(n, merged)
           });
           const record3 = setupSession.authenticationRecord();

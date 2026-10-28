@@ -1,6 +1,6 @@
 ---
-description: Set up Wicket's connection to Business Central from the chat - add one (no GUIDs to look up), fix one that fails, change the default, or remove one. Use when no connection is configured, when a Wicket call fails with connection-unavailable or a sign-in problem, or when the user wants another tenant, environment or company.
-argument-hint: "[add|fix|default|remove] [connection name]"
+description: Set up Wicket's connection to Business Central from the chat - view what is configured, add a connection (no GUIDs to look up), fix one that fails, change the default, or remove one. Use when no connection is configured, when a Wicket call fails with connection-unavailable or a sign-in problem, or when the user wants another tenant, environment or company.
+argument-hint: "[view|add|fix|default|remove] [connection name]"
 allowed-tools: AskUserQuestion, mcp__plugin_wicket_wicket__wicket_setup, mcp__plugin_wicket_wicket__wicket_connections, mcp__plugin_wicket_wicket__wicket_whoami
 ---
 
@@ -16,7 +16,28 @@ Call `wicket_setup` with `action: "status"`. It never prompts a sign-in.
 
 - If `problem.kind` is `invalid`, the file can't be read. Show the message and ask: "I'll fix the file by hand" or "Move it aside and start fresh". Only on the second answer, call `moveAsideBroken`, tell the user where the old file went, and continue with **Add**.
 - If there are no connections, go straight to **Add**.
-- Otherwise, summarise each connection in one line (name, environment, company, health), plus any `rejected` entry with its reason. Then ask what to do: Add a connection · Fix `<the first unhealthy one>` (when one is unhealthy) · Set the default · Remove a connection. Honour `$ARGUMENTS` when it already says which.
+- When `$ARGUMENTS` says `view`, go to **View**.
+- Otherwise, summarise each connection in one line (name, company or description, environment, health), plus any `rejected` entry with its reason. Then ask what to do: Add a connection · View the connections · Fix `<the first unhealthy one>` (only when one is unhealthy) · Change the default or remove one. For the last choice, ask which of the two next. Honour `$ARGUMENTS` when it already says which.
+
+## View
+
+Read-only: change nothing. From the `status` answer, show one short block per connection, the default first:
+
+- **`<name>`**, marked "(default)" when `isDefault` is set.
+- **Business Central:** the `company` (or else the `description`), then the environment.
+- **Sign-in:** browser, device code, or an app with a client secret.
+  - For a person's sign-in, say whether it goes through Wicket's default app (`usesDefaultClient`) or the user's own app registration.
+  - For an app, say the secret is in the Keychain under `<keychainAccount>`, or comes from the variable `<secretEnv>`.
+- **Writes:** "read-only" when `readOnly` is set, else "allowed (as far as the user's Business Central permissions go)".
+- **Health:** the `health.message` in plain words.
+- **Source:** `source: "env"` connections say they come from environment variables.
+
+After the blocks, add:
+- every `rejected` entry with its reason;
+- the `problem`, if there is one;
+- the file path, on one line at the end.
+
+Show IDs (tenant, company, client) only if the user asks for them. Then ask what to do next, with the same menu, minus View.
 
 ## 2. Add
 
@@ -45,7 +66,7 @@ Call `wicket_setup` with `action: "status"`. It never prompts a sign-in.
 5. **Environment.** Skip this step when step 3 gave one. Otherwise call `environments`. With one environment, just confirm it. With several, ask, preferring a sandbox when the user has said they're testing. If the call fails, ask for the BC address instead and `locate` it.
 6. **Company.** Call `companies` with the environment. If step 3 gave a `companyName`, preselect the company with that name or display name. With one company, confirm it. Otherwise ask by name.
 7. **Name.** Suggest `<company>-<environment>`: lower case, with anything outside `a-z0-9-` turned into `-`. When that name is taken, add `-2`. Offer the suggestion (Recommended) or a typed name. When other connections exist, also ask whether this one becomes the default.
-8. **Save and test.** Call `save` with `name`, `environment`, `companyId` and `makeDefault`.
+8. **Save and test.** Call `save` with `name`, `environment`, `companyId`, `companyName` (the company's name from step 6) and `makeDefault`.
    - If it answers that the name exists, ask whether to replace it. Only on a yes, save again with `replace: true`.
    - When `health.state` is `ok`, report in a few lines: signed in as, environment, company, and whether the connection is read-only (from `health.identity`). Then suggest `/wicket:orient`.
    - Any other state: say what it means and continue with the matching **Fix** step. The connection stays saved.
@@ -81,7 +102,7 @@ If the company is gone or renamed, pick it again with `companies`. For anything 
 
 A `rejected` entry carries its reason, such as an unknown key or a bad value. Rerun **Add** under the same name and save with `replace: true`. Only the fields setup writes change; the user's other settings stay.
 
-## 4. Set the default / Remove
+## 4. Change the default / Remove
 
 - **Default.** Ask which connection, then call `setDefault`.
 - **Remove.** Ask which connection, then confirm by name: "Remove `<name>`? This can't be undone." Only on a yes, call `remove`. Say that its saved sign-in is gone too. When the answer has `defaultCleared: true`, ask right away which connection becomes the default, and call `setDefault`. Until then, calls that name no connection are refused. If it used a Keychain secret, give the line to delete it: `! security delete-generic-password -s wicket -a <name>`.

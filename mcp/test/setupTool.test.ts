@@ -227,6 +227,57 @@ describe('wicket_setup', () => {
         expect(JSON.stringify(status)).not.toContain('SENTINEL');
     });
 
+    test('view: status rows name the company, the description, read-only and whether the default client is used', async () => {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(
+            file,
+            JSON.stringify({
+                default: 'up',
+                connections: {
+                    up: entry({ authMode: 'browser', clientId: undefined, secretEnv: undefined, readOnly: true, description: 'CRONUS · Production' }),
+                    down: entry({ authMode: 'browser', clientId: 'my-app', secretEnv: undefined, description: 'Fabrikam · Sandbox' }),
+                },
+            }),
+        );
+        stub.rpc(() => odata({ userId: 'ME', company: 'CRONUS' }));
+        await start({
+            createCredential: async (target) => ({
+                getToken: async () => {
+                    if (target.name === 'down') throw new SignInNeededError('down');
+                    return { token: 't' };
+                },
+                authenticationRecord: () => undefined,
+            }),
+            tokens: () => ({ getToken: async () => 't' }),
+        });
+        const status = toolJsonAs<{ connections: Array<Record<string, unknown>> }>(await setup({ action: 'status' }));
+        expect(status.connections[0]).toMatchObject({
+            name: 'up',
+            isDefault: true,
+            company: 'CRONUS',
+            description: 'CRONUS · Production',
+            readOnly: true,
+            usesDefaultClient: true,
+        });
+        expect(status.connections[1]).toMatchObject({ name: 'down', description: 'Fabrikam · Sandbox', readOnly: false, usesDefaultClient: false });
+        expect(status.connections[1]).not.toHaveProperty('company');
+    });
+
+    test('save records the company name as the description, and keeps a description already there', async () => {
+        routeAppToken();
+        stub.rpc(() => odata({}));
+        await start();
+        await setup({ action: 'signin', method: 'client_credentials', tenantId: TID, clientId: 'app-1', keychainService: 'wicket', keychainAccount: 'a' });
+        await setup({ action: 'save', name: 'a', environment: 'Production', companyId: COMPANY_A, companyName: 'CRONUS' });
+        expect(JSON.parse(readFileSync(file, 'utf8')).connections.a.description).toBe('CRONUS · Production');
+
+        const doc = JSON.parse(readFileSync(file, 'utf8'));
+        doc.connections.a.description = 'My own label';
+        writeFileSync(file, JSON.stringify(doc));
+        await setup({ action: 'save', name: 'a', environment: 'Sandbox', companyId: COMPANY_B, companyName: 'Fabrikam', replace: true });
+        expect(JSON.parse(readFileSync(file, 'utf8')).connections.a.description).toBe('My own label');
+    });
+
     test('status runs no interactive sign-in', async () => {
         mkdirSync(join(file, '..'), { recursive: true });
         writeFileSync(

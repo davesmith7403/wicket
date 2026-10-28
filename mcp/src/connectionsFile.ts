@@ -66,12 +66,18 @@ function edit(change: (doc: FileDoc) => void): void {
 export function upsertConnection(
     name: string,
     fields: Record<string, unknown>,
-    opts: { replace: boolean; makeDefault?: boolean; validate?: (name: string, merged: Record<string, unknown>) => void },
+    opts: {
+        replace: boolean;
+        makeDefault?: boolean;
+        /** Fields written only when the entry does not have them yet (a description the user may have changed). */
+        defaults?: Record<string, unknown>;
+        validate?: (name: string, merged: Record<string, unknown>) => void;
+    },
 ): void {
     edit((doc) => {
         const existing = doc.connections[name];
         if (existing && !opts.replace) throw new Error(`connection "${name}" exists`);
-        const merged = { ...(existing ?? {}), ...fields };
+        const merged = { ...(opts.defaults ?? {}), ...(existing ?? {}), ...fields };
         // Check the entry as it will be written, kept fields included (a companies allowlist, say).
         opts.validate?.(name, merged);
         doc.connections[name] = merged;
