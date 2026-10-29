@@ -154,7 +154,7 @@ try {
     const before = await call({ action: 'status' });
     const me = before.connections.find((c: any) => c.name === 'me');
     check(me?.health.state === 'signInNeeded', 'a person never signed in here is reported as needing a sign-in, without a prompt');
-    check(!stderr.includes('persistent token cache unavailable'), `the persistent token cache loaded (${windows ? 'DPAPI' : 'Keychain'})`);
+    check(!stderr.includes('persistent token cache unavailable'), `the persistent token cache loaded (${windows ? 'DPAPI' : 'encrypted file, key in the Keychain'})`);
 
     const page = await call({ action: 'secretPage', name: account });
     check(page.opened === false, 'no browser was opened (WICKET_OPEN_BROWSER=0); the address came back instead');

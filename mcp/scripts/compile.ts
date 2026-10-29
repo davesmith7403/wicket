@@ -25,9 +25,9 @@ export function hostPlatform(): Platform {
 
 /**
  * Native modules per platform. The WAM broker runtime is never used (Wicket has no broker plugin),
- * and it would inline this machine's path. On Windows the token cache uses DPAPI, which
- * msal-node-extensions loads by a computed path the compiler cannot follow: import it statically so
- * that arch's dpapi.node is embedded, and stub keytar, which is only for macOS and Linux.
+ * and it would inline this machine's path; keytar is never used either (see the stub). On Windows
+ * the token cache uses DPAPI, which msal-node-extensions loads by a computed path the compiler
+ * cannot follow: import it statically so that arch's dpapi.node is embedded.
  */
 function nativeModules(platform: Platform): BunPlugin {
     const windows = platform.startsWith('windows');
@@ -41,8 +41,10 @@ function nativeModules(platform: Platform): BunPlugin {
                 build.onLoad({ filter, namespace: 'stub' }, () => ({ contents, loader: 'js' }));
             };
             stub('@azure/msal-node-runtime', 'export const msalNodeRuntime = undefined; export const ErrorStatus = {}; export const LogLevel = {}; export default undefined;');
+            // keytar is used nowhere: macOS keeps the token cache in an encrypted file (tokenCache.ts),
+            // Windows in a DPAPI file. It is stubbed so the builds carry no native Keychain module.
+            stub('keytar', 'const no = async () => { throw new Error("keytar is not used by Wicket"); }; export default { getPassword: no, setPassword: no, deletePassword: no };');
             if (!windows) return;
-            stub('keytar', 'const no = async () => { throw new Error("keytar is not used on Windows"); }; export default { getPassword: no, setPassword: no, deletePassword: no };');
             build.onLoad({ filter: /msal-node-extensions[\\/]dist[\\/]Dpapi\.mjs$/ }, () => ({
                 contents: `import Dpapi from "../bin/${arch}/dpapi.node"; export { Dpapi };`,
                 loader: 'js',

@@ -20,7 +20,7 @@
  *     a human. No client secret (public-client flow); works with guest access in
  *     customer tenants. The @azure/identity package is imported dynamically, so a
  *     client_credentials-only deployment never loads it. The sign-in survives restarts:
- *     MSAL's token cache lives in the OS keychain (@azure/identity-cache-persistence) and the
+ *     MSAL's token cache persists (tokenCache.ts on macOS, DPAPI on Windows) and the
  *     account record in ~/.config/wicket/auth/<name>.json (persistTokenCache: false opts out).
  *
  * companyId is REQUIRED on every connection. Wicket's endpoint is company-scoped
@@ -35,6 +35,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { storeFor, type SecretStore } from './secretStore.js';
+import { cacheKeySource, wicketCachePlugin } from './tokenCache.js';
 
 // ---------------------------------------------------------------------------
 // Config locations
@@ -969,23 +970,39 @@ export async function createDelegatedCredential(
 }
 
 /**
- * Names the cache's change-tracking file (~/.IdentityService/<name>). On macOS the tokens themselves
- * sit in ONE keychain entry (Microsoft.Developer.IdentityService / MSALCache) whatever the name;
- * MSAL keys entries per tenant/client/account.
+ * The cache name @azure/identity passes to the persistence (on Windows it names the DPAPI file under
+ * %LOCALAPPDATA%\.IdentityService). MSAL keys entries per tenant/client/account.
  */
 const TOKEN_CACHE_NAME = 'wicket-mcp';
+
+/** Where the macOS token cache file lives: beside the saved sign-ins ($WICKET_AUTH_DIR, else ~/.config/wicket/auth). */
+export function tokenCachePath(): string {
+    const explicit = envSetting('AUTH_DIR');
+    return explicit ? join(explicit, 'token-cache.bin') : configPath('auth', 'token-cache.bin');
+}
+
+/**
+ * The @azure/identity plugin that persists the token cache. macOS: an encrypted file whose key the
+ * Keychain holds through `security` (tokenCache.ts), so no Wicket update meets a Keychain prompt.
+ * Windows: @azure/identity-cache-persistence, a DPAPI-protected file.
+ */
+export async function tokenCachePlugin(platform: NodeJS.Platform = process.platform): Promise<(context: unknown) => void> {
+    if (platform === 'darwin') return wicketCachePlugin(tokenCachePath(), cacheKeySource(keychain));
+    const { cachePersistencePlugin } = await import('@azure/identity-cache-persistence');
+    return cachePersistencePlugin as (context: unknown) => void;
+}
 
 let persistencePlugin: Promise<boolean> | undefined;
 
 /**
- * Register @azure/identity-cache-persistence once per process. On failure (package missing, no
- * keychain) warn and fall back to the in-memory cache — sign-in still works, it just does not
- * survive a restart.
+ * Register the token cache plugin once per process. On failure (package missing, no keychain)
+ * warn and fall back to the in-memory cache — sign-in still works, it just does not survive a
+ * restart.
  */
 function enableTokenCachePersistence(useIdentityPlugin: (plugin: never) => void): Promise<boolean> {
-    persistencePlugin ??= import('@azure/identity-cache-persistence')
-        .then(({ cachePersistencePlugin }) => {
-            useIdentityPlugin(cachePersistencePlugin as never);
+    persistencePlugin ??= tokenCachePlugin()
+        .then((plugin) => {
+            useIdentityPlugin(plugin as never);
             return true;
         })
         .catch((e: unknown) => {

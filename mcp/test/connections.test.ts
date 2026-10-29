@@ -16,6 +16,8 @@ import {
     configHome,
     envSetting,
     keychain,
+    tokenCachePath,
+    tokenCachePlugin,
     UserTokenProvider,
     SignInNeededError,
     SignInRequiredError,
@@ -1051,6 +1053,18 @@ describe('config locations', () => {
         } finally {
             find.mockRestore();
         }
+    });
+
+    test('the token cache on macOS is the encrypted file next to the saved sign-ins; Windows keeps DPAPI', async () => {
+        process.env.WICKET_AUTH_DIR = join(configHome.dir, 'auth-here');
+        expect(tokenCachePath()).toBe(join(configHome.dir, 'auth-here', 'token-cache.bin'));
+        let factory: (() => Promise<{ path?: string }>) | undefined;
+        const mac = await tokenCachePlugin('darwin');
+        mac({ cachePluginControl: { setPersistence: (f: typeof factory) => void (factory = f) } });
+        expect((await factory!()).path).toBe(tokenCachePath());
+        // The Windows plugin loads Microsoft's persistence package, whose keytar needs libsecret on Linux.
+        if (process.platform !== 'linux') expect(await tokenCachePlugin('win32')).toBeFunction();
+        delete process.env.WICKET_AUTH_DIR;
     });
 
     test('the secret store seam follows the platform: Keychain on macOS, the protected file on Windows', () => {
