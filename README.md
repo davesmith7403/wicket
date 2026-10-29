@@ -8,6 +8,9 @@ keys, and run named business actions such as posting a document — with a real 
 first. Everything goes through a deny-by-default endpoint inside Business Central: an administrator
 decides which tables are exposed, which fields are masked or hidden, and which actions may run.
 
+> **New here?** The [quick start](https://davesmith7403.github.io/wicket-bc/quick-start.html) connects Claude to a customer's Business Central in six steps, from
+> Windows or a Mac: three in Business Central, three in Claude Code.
+
 This repository is the **agent side** of Wicket:
 
 | Folder | What it is |
