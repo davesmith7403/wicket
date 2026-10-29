@@ -5,7 +5,8 @@ name: MCP typecheck and test
 # in-memory transport with a stubbed fetch), so neither an SDK-breaking change nor a behavioral
 # regression can ship silently. A failing assertion fails the job; typecheck alone never caught those.
 # skills/wicket-usage is watched too: the suite byte-compares it with the bundled mcp/skill copy.
-# plugin/ is watched because the suite checks its skill copy and its server bundle's source hash.
+# plugin/ is watched because the suite checks its skill copy, launchers and source hash.
+# It runs on Windows and macOS as well as Linux, plus an end-to-end smoke test on Windows and macOS.
 
 on:
   workflow_dispatch:
@@ -27,7 +28,12 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # The client is for Windows and Apple-silicon Macs; Linux stays as the quick baseline.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: mcp
@@ -36,6 +42,33 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13   # the version the suite was recorded green on locally
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mcp/launcher/go.mod
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
+      - run: go test ./...
+        working-directory: mcp/launcher
+
+  smoke:
+    # The real thing on each client platform: launcher download and start by the extensionless
+    # command, the compiled server, the token cache (DPAPI / Keychain), the secret page and store.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mcp/launcher/go.mod
+      - run: bun install --frozen-lockfile
+      - run: bun run scripts/smoke.ts

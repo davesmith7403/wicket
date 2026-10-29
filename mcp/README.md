@@ -375,7 +375,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.4.3+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.5.0+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -420,7 +420,17 @@ The MCP server also generates a few problems of its own, same shape:
 
 ## Install
 
-Requires [Bun](https://bun.sh) ≥ 1.0.
+With the Claude Code plugin nothing needs installing first, on Windows (x64 and arm64) or on an
+Apple-silicon Mac. The plugin carries a small launcher (`plugin/server/wicket`, `wicket.exe`; source
+in [`launcher/`](launcher/)) instead of the server: on the first start it downloads this platform's
+self-contained server from the GitHub release of the plugin's version, checks it against
+`plugin/server/SHA256SUMS`, unpacks it into `plugin/server/bin/<version>/`, and runs it. Every later
+start runs that copy. `bun run plugin:build` builds the three servers into `dist/server/` (the
+release assets), the launchers, and this Mac's own server copy, so the plugin read from this folder
+never downloads. `bun run scripts/smoke.ts` proves the whole path on the machine it runs on; CI runs
+it on Windows and macOS.
+
+Running from source (other MCP hosts, development) requires [Bun](https://bun.sh) ≥ 1.0:
 
 ```bash
 cd mcp
@@ -595,16 +605,18 @@ connection-unavailable`. A dangling default never falls back to another connecti
 Each connection resolves its client secret in this order (first match wins), and the
 secret is **never logged**:
 
-1. **`keychainService` + `keychainAccount`** — looked up from the **macOS Keychain**
-   via `security find-generic-password -s <service> -a <account> -w`. Store it with:
+1. **`keychainService` + `keychainAccount`** — looked up in the system's secret store: the
+   **macOS Keychain** (`security find-generic-password -s <service> -a <account> -w`), or on
+   **Windows** a file protected with DPAPI for the current user at
+   `%LOCALAPPDATA%\wicket\secrets\<service>\<account>.bin`. The easy way to store it on both is
+   `/wicket:setup` (or the `wicket_setup` action `secretPage`): a one-time page on `127.0.0.1` opens
+   in the browser, and the secret goes from there straight into the store. On a Mac this also works:
 
    ```bash
    security add-generic-password -s wicket -a contoso -w '<client-secret>'
    ```
-
-   This is macOS-only.
-2. **`secretEnv`** — the name of an environment variable holding the secret. This is
-   the **cross-platform** path (use it on Linux/Windows, or in CI).
+2. **`secretEnv`** — the name of an environment variable holding the secret (Linux, CI, or by
+   choice).
 3. **`clientSecret`** — an inline secret in the JSON. **Dev only** — the server warns
    on stderr (once per connection) when a connection uses it, and additionally warns at load if a
    `connections.json` carrying an inline secret is group/other-readable (suggesting
@@ -673,8 +685,8 @@ public-client `clientId`; omit every secret field.
 **`browser`** — the same delegated sign-in as `device_code`, but a browser window opens on the
 machine running the server (MSAL's `InteractiveBrowserCredential`, redirect to `http://localhost`),
 so there is no code to type. Everything else is shared with `device_code`: the non-blocking first
-call (the `401 sign-in-required` problem says a window opened, with no `userCode`), the Keychain-
-persisted token cache and the account record in `~/.config/wicket/auth/<connection>.json`. It needs
+call (the `401 sign-in-required` problem says a window opened, with no `userCode`), the persisted
+token cache (the Keychain on macOS, DPAPI on Windows) and the account record in `~/.config/wicket/auth/<connection>.json`. It needs
 a desktop session; over SSH use `device_code`. For both delegated modes `clientId` is optional and
 defaults to Wicket's default public client `1950a258-227b-4e31-a9cf-717495945fc2`.
 

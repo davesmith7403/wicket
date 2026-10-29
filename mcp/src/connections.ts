@@ -30,12 +30,11 @@
  * member (validated at load).
  */
 
-import { execFile } from 'node:child_process';
 import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { z } from 'zod';
+import { storeFor, type SecretStore } from './secretStore.js';
 
 // ---------------------------------------------------------------------------
 // Config locations
@@ -65,8 +64,6 @@ export function authRecordPath(connectionName: string): string {
     const explicit = envSetting('AUTH_DIR');
     return explicit ? join(explicit, name) : configPath('auth', name);
 }
-
-const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Schema for connections.json
@@ -252,13 +249,18 @@ function errorText(err: unknown): string {
 }
 
 /** Validate one connections.json entry. Throws with a message naming the entry's path. */
-export function validateConnectionEntry(name: string, raw: unknown): ConnectionSpec {
+/** Throw when `name` cannot name a connection. */
+export function assertConnectionName(name: string): void {
     if (!CONNECTION_NAME_RE.test(name)) {
         throw new Error(`Connection name "${name}" is invalid (use [A-Za-z0-9._-], <=64 chars).`);
     }
     if (RESERVED_NAMES.has(name)) {
         throw new Error(`Connection name "${name}" is invalid (a reserved word; choose another name).`);
     }
+}
+
+export function validateConnectionEntry(name: string, raw: unknown): ConnectionSpec {
+    assertConnectionName(name);
     const result = ConnectionEntry.safeParse(raw);
     if (!result.success) {
         throw new Error(
@@ -417,7 +419,8 @@ export class ConnectionRegistry {
             // should not be readable by group/other. Warn once; never fail the load.
             if (inlineSecret) {
                 try {
-                    if (statSync(file).mode & 0o077) {
+                    // Windows has no POSIX modes (every file reads as 0o666): nothing to hint there.
+                    if (process.platform !== 'win32' && statSync(file).mode & 0o077) {
                         process.stderr.write(
                             `wicket-mcp: ${file} contains an inline clientSecret and is ` +
                                 `group/other-readable — consider: chmod 600 ${file}\n`,
@@ -551,18 +554,15 @@ export class ConnectionRegistry {
 // ---------------------------------------------------------------------------
 
 /**
- * Test seam: one macOS keychain read. Async execFile, NOT execFileSync: a locked-keychain modal on
- * one connection must not freeze the event loop (and every other connection).
+ * Test seam: the system's secret store (see secretStore.ts): the Keychain on macOS, a DPAPI-protected
+ * file on Windows. Each call picks the platform's store, so a test can replace one method.
  */
 export const keychain = {
-    async find(service: string, account: string): Promise<string> {
-        const { stdout } = await execFileAsync(
-            'security',
-            ['find-generic-password', '-s', service, '-a', account, '-w'],
-            { encoding: 'utf8' },
-        );
-        return stdout.trim();
-    },
+    kind: (): SecretStore['kind'] => storeFor(process.platform).kind,
+    find: (service: string, account: string): Promise<string> => storeFor(process.platform).find(service, account),
+    store: (service: string, account: string, secret: string): Promise<void> =>
+        storeFor(process.platform).store(service, account, secret),
+    remove: (service: string, account: string): Promise<void> => storeFor(process.platform).remove(service, account),
 };
 
 /** Specs already warned about an inline clientSecret — the warning is once per connection. */
@@ -572,12 +572,13 @@ export async function resolveSecret(spec: ConnectionSpec): Promise<string> {
     if (spec.keychainService && spec.keychainAccount) {
         try {
             return await keychain.find(spec.keychainService, spec.keychainAccount);
-        } catch {
+        } catch (err) {
+            // The store's own reason (an invalid name, a refused Keychain) beats a guess; never the secret.
+            const reason = err instanceof Error && /invalid|refused|denied/i.test(err.message) ? ` ${err.message}` : '';
             throw new Error(
-                `Connection "${spec.name}": keychain lookup failed ` +
-                    `(service=${spec.keychainService}, account=${spec.keychainAccount}). ` +
-                    `Add it with: security add-generic-password -s ${spec.keychainService} ` +
-                    `-a ${spec.keychainAccount} -w '<secret>'`,
+                `Connection "${spec.name}": no client secret found in the system's secret store ` +
+                    `(service=${spec.keychainService}, account=${spec.keychainAccount}).${reason} ` +
+                    'Store it again with /wicket:setup (Fix), or the wicket_setup action secretPage.',
             );
         }
     }

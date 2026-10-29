@@ -11,6 +11,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+    SKILL_DIR_DEFAULT,
+    resolveSkillDir,
     INSTRUCTIONS_MAX_CHARS,
     bundleSkill,
     findSkillSection,
@@ -64,6 +66,20 @@ beforeEach(() => {
 
 afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+});
+
+describe('resolveSkillDir', () => {
+    test('the launcher-given WICKET_SKILL_DIR wins: a compiled server has no files of its own', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'wicket-skill-'));
+        try {
+            writeFileSync(join(dir, 'SKILL.md'), '# x');
+            expect(resolveSkillDir({ WICKET_SKILL_DIR: dir })).toBe(dir);
+            // Without it, the module-relative copies are used as before.
+            expect(resolveSkillDir({})).toBe(SKILL_DIR_DEFAULT);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
 });
 
 describe('skillFiles', () => {

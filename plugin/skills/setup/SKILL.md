@@ -27,7 +27,7 @@ Read-only: change nothing. From the `status` answer, show one short block per co
 - **Business Central:** the `company` (or else the `description`), then the environment.
 - **Sign-in:** browser, device code, or an app with a client secret.
   - For a person's sign-in, say whether it goes through Wicket's default app (`usesDefaultClient`) or the user's own app registration.
-  - For an app, say the secret is in the Keychain under `<keychainAccount>`, or comes from the variable `<secretEnv>`.
+  - For an app, say the secret is in this computer's secret store under `<keychainAccount>` (the Keychain on a Mac, protected for the user's Windows account on Windows), or comes from the variable `<secretEnv>`.
 - **Writes:** "read-only" when `readOnly` is set, else "allowed (as far as the user's Business Central permissions go)".
 - **Health:** the `health.message` in plain words.
 - **Source:** `source: "env"` connections say they come from environment variables.
@@ -76,11 +76,7 @@ Show IDs (tenant, company, client) only if the user asks for them. Then ask what
 1. Ask for the tenant: a pasted BC address or a domain, which goes to `locate`, or a tenant ID typed by the user.
 2. Ask for the app's client ID, which the user types.
 3. Ask for the connection name, as in step 7. The secret is filed under that name.
-4. Ask the user to copy the client secret to the clipboard, then run this themselves in this chat, so the secret never appears in it:
-
-   `! security add-generic-password -U -s wicket -a <name> -w "$(pbpaste)"`
-
-   Ask them to tell you when they've done it.
+4. Call `secretPage` with that `name`. A page opens in the user's browser: they paste the secret there and it goes straight into this computer's secret store, never through the chat. Say so, give the `url` in case the browser didn't open, and ask them to tell you when the page says it's stored. The page works once and closes after 10 minutes; call `secretPage` again if it expired.
 5. Call `signin` with `method: "client_credentials"`, the `tenantId`, the `clientId`, `keychainService: "wicket"` and `keychainAccount: <name>`. If it fails, show the message, which says whether the secret or the app was refused.
 6. The environment comes from the address if there was one. Otherwise call `environments`; if that's refused, which is common for apps, ask the user to type the environment name.
 7. Run the company step, then save as in step 8, with the same `name`.
@@ -92,8 +88,8 @@ Explain the connection's `health.state` in one sentence, then offer the matching
 | state | fix |
 |---|---|
 | `signInNeeded` | When the message says the connection keeps no saved sign-in, nothing needs fixing: the first Wicket call shows the sign-in prompt. Otherwise, sign in again: `signin` with `restart: true` and the connection's `authMode` as `method`, plus the `tenantId` and `clientId` from its status row (and its `keychainService`/`keychainAccount` for an app). Then `save` with `replace: true` and the same name, environment and company. |
-| `secretMissing` | The Keychain line from 2b step 4 (same name), then `status` again. |
-| `tokenRefused` | Show the message. A wrong or expired secret goes back to the Keychain line; an unknown client ID or missing consent means rerunning **Add** with Wicket's default client, or asking the tenant's admin. |
+| `secretMissing` | `secretPage` with the connection's name (2b step 4), then `status` again. |
+| `tokenRefused` | Show the message. A wrong or expired secret goes back to `secretPage`; an unknown client ID or missing consent means rerunning **Add** with Wicket's default client, or asking the tenant's admin. |
 | `wicketNotFound` | Say that Wicket isn't installed in that environment, or that the environment was renamed. Offer to pick the environment again (`environments`), then save with `replace: true`. |
 | `bcRefused` | Show the message: the BC admin must add the user or app, or assign a Wicket permission set. Change nothing here. |
 | `unreachable` | Say Business Central didn't answer in time. Suggest checking the network and running `/wicket:setup` again. |
@@ -105,6 +101,6 @@ A `rejected` entry carries its reason, such as an unknown key or a bad value. Re
 ## 4. Change the default / Remove
 
 - **Default.** Ask which connection, then call `setDefault`.
-- **Remove.** Ask which connection, then confirm by name: "Remove `<name>`? This can't be undone." Only on a yes, call `remove`. Say that its saved sign-in is gone too. When the answer has `defaultCleared: true`, ask right away which connection becomes the default, and call `setDefault`. Until then, calls that name no connection are refused. If it used a Keychain secret, give the line to delete it: `! security delete-generic-password -s wicket -a <name>`.
+- **Remove.** Ask which connection, then confirm by name: "Remove `<name>`? This can't be undone." Only on a yes, call `remove`. Say that its saved sign-in, and a secret setup stored for it, are gone too. When the answer has `defaultCleared: true`, ask right away which connection becomes the default, and call `setDefault`. Until then, calls that name no connection are refused.
 
 A connection that comes from environment variables (`source: "env"`) can't be changed here. Say so, and say which `BC_*` variables set it.

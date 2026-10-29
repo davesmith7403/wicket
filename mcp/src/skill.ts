@@ -18,12 +18,24 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 /**
- * The bundled guide: `skill/` beside `src/` in the package, or `skills/wicket-usage/` beside
- * `server/` in the Claude Code plugin, where one copy serves both this server and the host.
+ * The bundled guide relative to this module: `skill/` beside `src/` in the package, or
+ * `skills/wicket-usage/` beside `server/` in a bundled plugin.
  */
-export const SKILL_DIR = [join(import.meta.dir, '..', 'skill'), join(import.meta.dir, '..', 'skills', 'wicket-usage')].find(
+export const SKILL_DIR_DEFAULT = [join(import.meta.dir, '..', 'skill'), join(import.meta.dir, '..', 'skills', 'wicket-usage')].find(
     (dir) => existsSync(join(dir, 'SKILL.md')),
 ) ?? join(import.meta.dir, '..', 'skill');
+
+/**
+ * Where the guide is read from. The plugin's launcher sets WICKET_SKILL_DIR to the plugin's
+ * `skills/wicket-usage/`: a compiled server has no files beside it, and one copy then serves both
+ * this server and the host.
+ */
+export function resolveSkillDir(env: Record<string, string | undefined>): string {
+    const given = env.WICKET_SKILL_DIR;
+    return given && existsSync(join(given, 'SKILL.md')) ? given : SKILL_DIR_DEFAULT;
+}
+
+export const SKILL_DIR = resolveSkillDir(process.env);
 
 /** Budget for the MCP `instructions` text: it rides along in every session's system prompt, and older Claude Code builds cut it at 2,048 characters. */
 export const INSTRUCTIONS_MAX_CHARS = 2048;

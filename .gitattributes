@@ -1,0 +1,9 @@
+# The MCP server, skill and plugin are text with LF everywhere, so a Windows checkout hashes and
+# compares like a Mac one; the launchers are binaries.
+mcp/** text=auto eol=lf
+skills/** text=auto eol=lf
+plugin/** text=auto eol=lf
+# The single-file skill the suite regenerates and compares byte for byte.
+docs/wicket-usage-skill.md text eol=lf
+plugin/server/wicket binary
+plugin/server/wicket.exe binary

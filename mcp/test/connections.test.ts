@@ -1026,17 +1026,36 @@ describe('config locations', () => {
         process.env.WICKET_CACHE_DIR = sandboxCache;
     });
 
-    test('a keychain miss is reported for the configured service after exactly one lookup', async () => {
+    test('a missing stored secret is reported for the configured service after exactly one lookup, with a step that works on any platform', async () => {
         const find = spyOn(keychain, 'find').mockImplementation(async () => {
             throw new Error('not found');
         });
         try {
             await expect(
                 resolveSecret(spec({ secretEnv: undefined, keychainService: 'wicket', keychainAccount: 'contoso' })),
-            ).rejects.toThrow(/service=wicket, account=contoso.*security add-generic-password -s wicket -a contoso/);
+            ).rejects.toThrow(/service=wicket, account=contoso\). Store it again with \/wicket:setup/);
             expect(find.mock.calls).toEqual([['wicket', 'contoso']]);
         } finally {
             find.mockRestore();
         }
+    });
+
+    test('a lookup that fails for a reason of its own says that reason', async () => {
+        const find = spyOn(keychain, 'find').mockImplementation(async () => {
+            throw new Error('The secret\'s service "my vault" is invalid (use [A-Za-z0-9._-], <=64 chars, not a Windows device name).');
+        });
+        try {
+            await expect(
+                resolveSecret(spec({ secretEnv: undefined, keychainService: 'my vault', keychainAccount: 'contoso' })),
+            ).rejects.toThrow(/"my vault" is invalid/);
+        } finally {
+            find.mockRestore();
+        }
+    });
+
+    test('the secret store seam follows the platform: Keychain on macOS, the protected file on Windows', () => {
+        expect(keychain.store).toBeFunction();
+        expect(keychain.remove).toBeFunction();
+        expect(keychain.kind()).toBe(process.platform === 'win32' ? 'dpapi' : process.platform === 'darwin' ? 'keychain' : 'none');
     });
 });

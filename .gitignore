@@ -3,3 +3,7 @@ node_modules/
 .env.local
 .DS_Store
 **/.DS_Store
+
+# Server builds (release assets) and the local server copy for the plugin read from this folder
+/dist/
+/plugin/server/bin/

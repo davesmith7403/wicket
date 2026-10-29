@@ -44,6 +44,8 @@ let stub: FetchStub;
 let harness: ServerHarness | undefined;
 let file: string;
 const realKeychainFind = keychain.find;
+/** The real fetch, for the one test that talks to a local page (the suite stubs fetch per test). */
+const realFetch = globalThis.fetch;
 
 beforeEach(() => {
     restoreEnv = sandboxEnv();
@@ -368,6 +370,66 @@ describe('wicket_setup', () => {
         expect(stub.requests).toHaveLength(0);
         signedIn = true;
         expect(await health()).toBe('ok');
+    });
+
+    test('secretPage opens a one-time page whose secret lands in the system store under the connection name', async () => {
+        const opened: string[] = [];
+        const stored: unknown[] = [];
+        const realStore = keychain.store;
+        keychain.store = async (service, account, secret) => void stored.push([service, account, secret]);
+        try {
+            await start({ openUrl: async (url) => void opened.push(url) });
+            const res = toolJsonAs<{ opened: boolean; url: string; expiresInMinutes: number }>(await setup({ action: 'secretPage', name: 'contoso' }));
+            expect(res).toMatchObject({ opened: true, expiresInMinutes: 10 });
+            expect(opened).toEqual([res.url]);
+            const posted = await realFetch(res.url, {
+                method: 'POST',
+                body: 'secret=s3cret',
+                headers: { Origin: new URL(res.url).origin, 'Content-Type': 'application/x-www-form-urlencoded' },
+            });
+            expect(posted.status).toBe(200);
+            expect(stored).toEqual([['wicket', 'contoso', 's3cret']]);
+        } finally {
+            keychain.store = realStore;
+        }
+    });
+
+    test('secretPage still answers with the address when no browser can be opened (SSH, a server)', async () => {
+        await start({ openUrl: async () => Promise.reject(new Error('no display')) });
+        const res = toolJsonAs<{ opened: boolean; url: string }>(await setup({ action: 'secretPage', name: 'contoso' }));
+        expect(res.opened).toBe(false);
+        expect(res.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{64}$/);
+        // Closing the MCP connection closes the page with it.
+        await harness!.close();
+        harness = undefined;
+        const after = await realFetch(res.url).catch(() => undefined);
+        expect(after?.status ?? 404).toBe(404);
+    });
+
+    test('removing a connection also removes the secret setup stored for it, and only that one', async () => {
+        process.env.WICKET_TEST_SECRET = 's';
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(
+            file,
+            JSON.stringify({
+                default: 'a',
+                connections: {
+                    a: entry({ keychainService: 'wicket', keychainAccount: 'a', secretEnv: undefined }),
+                    b: entry({ keychainService: 'corp-vault', keychainAccount: 'b', secretEnv: undefined }),
+                    c: entry(),
+                },
+            }),
+        );
+        const removed: unknown[] = [];
+        const realRemove = keychain.remove;
+        keychain.remove = async (service, account) => void removed.push([service, account]);
+        try {
+            await start();
+            for (const name of ['a', 'b']) expect(toolIsError(await setup({ action: 'remove', name }))).toBe(false);
+            expect(removed).toEqual([['wicket', 'a']]);
+        } finally {
+            keychain.remove = realRemove;
+        }
     });
 
     test('status runs no interactive sign-in', async () => {

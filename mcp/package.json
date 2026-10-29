@@ -1,6 +1,6 @@
 {
   "name": "wicket-mcp",
-  "version": "2.4.3",
+  "version": "2.5.0",
   "description": "Model Context Protocol server fronting Wicket \u2014 exposes the Wicket operations as native MCP tools.",
   "type": "module",
   "private": true,

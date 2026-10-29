@@ -36,6 +36,7 @@ import {
     ConnectionRegistry,
     ConnectionUnavailableError,
     SignInRequiredError,
+    assertConnectionName,
     DEFAULT_PUBLIC_CLIENT_ID,
     authRecordPath,
     connectionsFile,
@@ -43,6 +44,7 @@ import {
     validateConnectionEntry,
     writeAuthRecord,
     isTimeoutError,
+    keychain,
     makeTokenSource,
     type ConnectionSpec,
     type TokenSource,
@@ -66,6 +68,7 @@ import {
     upsertSection,
 } from './schemaKnowledge.js';
 import { findSkillSection, instructionsFrom, loadSkillDoc, renderSkillToc } from './skill.js';
+import { openInBrowser, startSecretPage, type SecretPage } from './secretPage.js';
 import { moveAsideBroken, removeConnection, setDefaultConnection, upsertConnection } from './connectionsFile.js';
 import {
     SETUP_SESSION_NAME,
@@ -86,7 +89,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.4.3';
+export const SERVER_VERSION = '2.5.0';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -1192,6 +1195,8 @@ export interface BuildServerOptions {
     setupSession?: SetupSession;
     /** How setup's health checks build a delegated credential (a seam for tests). */
     createCredential?: typeof createDelegatedCredential;
+    /** How setup opens a page in the browser (a seam for tests). */
+    openUrl?: (url: string) => Promise<void>;
 }
 
 export function buildServer(pool: ClientPool, registry: ConnectionRegistry, options: BuildServerOptions = {}): McpServer {
@@ -1968,6 +1973,9 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
 
     // --- Guided setup: works with no connection at all, so it is not a BC-endpoint tool. ---
     const setupSession = options.setupSession ?? new SetupSession();
+    /** The one secret page setup has open; a new one replaces it, and closing the server closes it. */
+    let secretPage: SecretPage | undefined;
+    server.server.onclose = () => secretPage?.close();
     const healthOf = (spec: ConnectionSpec) =>
         checkHealth(spec, () => pool.get(spec.name).call('whoAmI', {}), {
             ...(options.createCredential ? { createCredential: options.createCredential } : {}),
@@ -2023,11 +2031,14 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 'once the user has signed in), signedIn {upn or appId, tenantId}, or failed; `environments`; ' +
                 '`companies` {environment, companyName? (→ `match`, the company of that name)}; `save` {name, environment, companyId, companyName?, makeDefault?, replace?} writes ' +
                 'the connection from the signed-in session and tests it with whoami; `remove` {name} (destructive: ' +
-                'confirm with the user first; `defaultCleared` means ask which connection becomes the default); `setDefault` {name}; `moveAsideBroken` renames an unreadable ' +
+                'confirm with the user first; `defaultCleared` means ask which connection becomes the default; a secret setup stored ' +
+                'for it goes too); `setDefault` {name}; `secretPage` {name} opens a one-time page in the browser where the user ' +
+                'pastes the app\'s client secret, stored in the system\'s secret store (Keychain on macOS, DPAPI on Windows) under ' +
+                'keychainService "wicket" and keychainAccount name; `moveAsideBroken` renames an unreadable ' +
                 'connections.json (only on the user\'s yes). Add = locate → signin → environments → companies → ' +
                 'save. Secrets never pass through this tool: a client secret is read from the Keychain item.',
             inputSchema: {
-                action: z.enum(['status', 'locate', 'signin', 'environments', 'companies', 'save', 'remove', 'setDefault', 'moveAsideBroken']),
+                action: z.enum(['status', 'locate', 'signin', 'environments', 'companies', 'save', 'remove', 'setDefault', 'secretPage', 'moveAsideBroken']),
                 hint: z.string().optional().describe('locate: a BC web address, an email or a domain.'),
                 method: z.enum(['browser', 'device_code', 'client_credentials']).optional().describe('signin: how to sign in.'),
                 restart: z
@@ -2044,7 +2055,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                     .string()
                     .optional()
                     .describe('companies: the name from locate, answered as `match`; save: the company name, kept as the connection description when it has none.'),
-                name: z.string().optional().describe('save / remove / setDefault: the connection name.'),
+                name: z.string().optional().describe('save / remove / setDefault / secretPage: the connection name.'),
                 makeDefault: z.boolean().optional().describe('save: make it the default connection.'),
                 replace: z.boolean().optional().describe('save: overwrite an existing connection of that name (fields not given are kept).'),
             },
@@ -2154,7 +2165,12 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                     case 'remove': {
                         const name = need(args.name, 'name');
                         refuseEnv(name);
+                        const spec = registry.list().some((c) => c.name === name) ? registry.resolve(name) : undefined;
                         const { defaultCleared } = removeConnection(name);
+                        // Only the secret setup itself filed (service "wicket"); a vault entry the user named stays.
+                        if (spec?.keychainService === 'wicket' && spec.keychainAccount) {
+                            await keychain.remove(spec.keychainService, spec.keychainAccount).catch(() => undefined);
+                        }
                         registry.reload();
                         return ok({
                             removed: name,
@@ -2169,6 +2185,23 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         setDefaultConnection(name);
                         registry.reload();
                         return ok({ default: name, current: registry.current() });
+                    }
+                    case 'secretPage': {
+                        const name = need(args.name, 'name');
+                        assertConnectionName(name);
+                        secretPage?.close();
+                        secretPage = await startSecretPage({ service: 'wicket', account: name, store: keychain.store });
+                        const opened = await (options.openUrl ?? openInBrowser)(secretPage.url).then(
+                            () => true,
+                            () => false,
+                        );
+                        return ok({
+                            opened,
+                            url: secretPage.url,
+                            expiresInMinutes: 10,
+                            store: keychain.kind(),
+                            next: 'When the user says it is stored, call signin with method client_credentials, keychainService "wicket" and keychainAccount this name.',
+                        });
                     }
                     case 'moveAsideBroken': {
                         registry.reload();
@@ -2220,6 +2253,12 @@ async function main(): Promise<void> {
     const server = buildServer(pool, registry);
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    // The host closing stdin ends the session. Exit then, even while an open secret page or a
+    // browser sign-in keeps the event loop busy: on Windows the launcher cannot exec, and a server
+    // left behind would outlive the session and lock the plugin's folder.
+    const exit = () => process.exit(0);
+    process.stdin.once('end', exit);
+    process.stdin.once('close', exit);
     // stdio servers communicate over stdout/stdin only; log to stderr.
     const cur = registry.current();
     process.stderr.write(
@@ -2234,9 +2273,12 @@ async function main(): Promise<void> {
 // Start only when executed as the entrypoint (`bun run src/index.ts`, the `wicket-mcp` bin).
 // Importing this module — as the test suite does to reach the exported client, pool, and
 // buildServer — must not open a stdio transport or read the operator's connections.
-if (import.meta.main) {
+/** Start the server on stdio; a start-up failure is reported on stderr with exit code 1. */
+export function start(): void {
     main().catch((err) => {
         process.stderr.write(`wicket-mcp failed to start: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
         process.exit(1);
     });
 }
+
+if (import.meta.main) start();

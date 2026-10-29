@@ -43,8 +43,11 @@ describe('upsertConnection', () => {
     test('creates the file and directory with 600/700 when none exists', () => {
         upsertConnection('fresh', entry(), { replace: false });
         expect(read().connections.fresh).toMatchObject({ tenantId: 'tenant-a' });
-        expect(statSync(file).mode & 0o777).toBe(0o600);
-        expect(statSync(join(file, '..')).mode & 0o777).toBe(0o700);
+        // Windows has no POSIX modes; the file sits in the user's own profile there.
+        if (process.platform !== 'win32') {
+            expect(statSync(file).mode & 0o777).toBe(0o600);
+            expect(statSync(join(file, '..')).mode & 0o777).toBe(0o700);
+        }
     });
 
     test('update keeps fields setup did not pass', () => {
