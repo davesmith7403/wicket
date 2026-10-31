@@ -9,7 +9,7 @@ posting a document — with a real posting preview first — and look back at wh
 decides which tables are exposed, which fields are masked or hidden, and which actions may run.
 
 > **New here?** The [quick start](https://davesmith7403.github.io/wicket-bc/quick-start.html) connects Claude to a customer's Business Central in six steps, from
-> Windows or a Mac: three in Business Central, three in Claude Code.
+> Windows or a Mac: three in Business Central, three in Claude Code or the Claude desktop app.
 
 This repository is the **agent side** of Wicket:
 
@@ -57,9 +57,26 @@ chat. To write the file by hand instead, see [mcp/README.md](mcp/README.md#conne
 
 Download `wicket-<version>.mcpb` from the
 [latest release](https://github.com/davesmith7403/wicket/releases/latest) and open it: the desktop app
-shows the extension and installs it with one click. Then say **"set up Wicket"** in a chat; the
+shows the extension and installs it with one click. Then say **"set up Wicket"** in a chat ([quick start, desktop steps](https://davesmith7403.github.io/wicket-bc/quick-start.html#desktop)); the
 same guided setup runs there, and connections are shared with Claude Code on the same machine.
 Pages Claude builds in the desktop app (dashboards, reports) can query Wicket live while you have them open.
+
+### Claude Code or the desktop app?
+
+Both run the same server with the same tools and the same usage skill, and on one machine they share
+the connections, the saved sign-ins and any client secret: set up in one, and the other is connected
+too. What differs is the app around Wicket.
+
+| | Claude Code (the plugin) | Claude desktop app (the `.mcpb` extension) |
+|---|---|---|
+| Install | `/plugin marketplace add`, then `/plugin install` | Open the `.mcpb` and confirm |
+| Setup and helpers | `/wicket:setup`, `/wicket:orient` and `/wicket:inventory` | No commands: say "set up Wicket", and the same guided setup runs through the tool |
+| Updates | `/plugin marketplace update wicket`, then restart Claude Code | Open the `.mcpb` from the new release |
+| Dashboards and reports | Builds them; their pages query Business Central live only when opened in the desktop app | Pages query Business Central live while they are open |
+| Files and automation | Works on your disk: writes Excel and CSV exports to a folder, runs scripts, works next to your code | Chat first: answers, documents and pages, and an export comes as a file to download |
+
+The desktop app suits people who mainly ask questions and want dashboards; Claude Code suits whoever
+also exports data, automates or works on Business Central code. Installing both is fine.
 
 ### Other hosts
 
