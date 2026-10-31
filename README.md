@@ -44,6 +44,11 @@ The repository root is also the plugin's marketplace.
 /plugin install wicket@wicket
 ```
 
+To get new versions without asking, turn on auto-update once: run `/plugin`, open **Marketplaces**, choose
+**wicket** and **Enable auto-update**. Claude Code leaves it off for marketplaces outside Anthropic's own; without
+it, update with **Update now** on the plugin under `/plugin` → **Installed**, or `claude plugin update wicket@wicket`
+in your shell. A new version loads with the next session, or at once with `/reload-plugins`.
+
 Then run **`/wicket:setup`**. It asks how you sign in (in the browser, with a device code, or as an
 app with a client secret), works out the tenant from a pasted Business Central address or your work
 email, and lets you pick the environment and company from lists: no IDs to look up. It saves the
@@ -71,7 +76,7 @@ too. What differs is the app around Wicket.
 |---|---|---|
 | Install | `/plugin marketplace add`, then `/plugin install` | Open the `.mcpb` and confirm |
 | Setup and helpers | `/wicket:setup`, `/wicket:orient` and `/wicket:inventory` | No commands: say "set up Wicket", and the same guided setup runs through the tool |
-| Updates | `/plugin marketplace update wicket`, then restart Claude Code | Open the `.mcpb` from the new release |
+| Updates | Automatic once you turn on auto-update for the `wicket` marketplace (`/plugin` → **Marketplaces**); otherwise **Update now** on the plugin under `/plugin` → **Installed** | Open the `.mcpb` from the new release |
 | Dashboards and reports | Builds them; their pages query Business Central live only when opened in the desktop app | Pages query Business Central live while they are open |
 | Files and automation | Works on your disk: writes Excel and CSV exports to a folder, runs scripts, works next to your code | Chat first: answers, documents and pages, and an export comes as a file to download |
 
