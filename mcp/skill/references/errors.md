@@ -14,6 +14,8 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `select-and-selectFieldNo` / `invalid-select` | Both select forms, or `"*"` mixed with names | One form; `"*"` alone |
 | `invalid-aggregate` | Aggregate combined with a row-plane key, an unknown key, or `sum`/`avg` on a FlowField or non-numeric field | Aggregate with `filter` only; sum the stored field of the table the FlowField is computed from (`references/tables.md`) |
 | `invalid-orderby` | Mixed directions, or fields that match no key | One direction; a key from `describe`, or no `orderBy` and client-side sort |
+| `batch-too-large` | A `batch` with more than `capabilities.limits.maxBatchItems` (100) items | Split it into several batches |
+| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, or a field that does not exist | Reference only earlier items that wrote a record; take the field name from `describe` |
 | `invalid-cursor` | A cursor from another table, query shape or connection | Pass `@nextLink` back unchanged with the same query, or restart |
 | `record-table-mismatch` | A `recordId` from another table | Re-query the right table |
 | `not-binary` | `readBlob` on a non-binary field | A `BLOB`/`Media` field from `describe` |
@@ -42,6 +44,8 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `invoke-disabled` / `action-disabled` | Enrolled, but `Allow Run` is off | An administrator enables it; the same idempotency key can then be reused |
 | `async-not-configured` | `deliver` on a tenant without a usable async configuration | Read inline or page; an administrator completes the setup |
 | `replay-withheld` | A resend under a key whose original request completed, but whose stored result you may no longer see (`originalStatus`, `reason`) | It already happened: never repeat it under a new key |
+| `changes-off` | `changes` while the change history is off, or not readable by the agent, on the Wicket Setup card | Say so; an administrator turns it on (Change History). The Wicket Changes page in BC still shows what was recorded |
+| `changes-forbidden` | `changes` with `user` without the Wicket - Audit Changes permission set | Omit `user` to see your own changes; an administrator assigns the set for everyone's |
 | `api-not-routable` (MCP) | `wicket_api_read` while routing is `Off` or the source table is not readable | `wicket_query` on `suggest.tableId` |
 
 ## Not found (404)
@@ -55,7 +59,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `no-page` | `pageUrl` on a table without a default lookup page | Pass `pageId` |
 | `empty-blob` | The media field has no content | Nothing to fetch |
 | `unknown-request` | An async request that is unknown, malformed or not yours | A `requestId` from your own submit or `wicket_requests` |
-| `unknown-operation` | The operation name is not one of the sixteen (HTTP clients) | One of `suggest`'s operations |
+| `unknown-operation` | The operation name is not one of the eighteen (HTTP clients) | One of `suggest`'s operations |
 | `unknown-section` | `skill` section matching no `## ` heading | A title from `suggest.sections` |
 | `skill-not-configured` | The endpoint has no hosted guide | Irrelevant through MCP: `wicket_skill` is local |
 

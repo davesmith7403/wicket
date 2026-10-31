@@ -13,11 +13,15 @@
  * - plugin/server/bin/<version>/: this Mac's own build, so the plugin read straight from this
  *   repository never downloads (git-ignored).
  * - plugin/skills/wicket-usage/: the skill, one copy for Claude Code and the server.
+ * - dist/wicket-<version>.mcpb: the Claude desktop app extension (release asset), and
+ *   dist/wicket-<version>-local.mcpb with this Mac's server inside, to install before the release
+ *   exists (scripts/desktop.ts).
  */
 import { $ } from 'bun';
 import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TARGETS, buildLauncher, compileServer } from './compile.ts';
+import { buildDesktopExtension } from './desktop.ts';
 import { skillFiles } from '../src/skill.ts';
 import { PLUGIN_DIR, pluginSourceHash } from '../src/plugin.ts';
 
@@ -78,4 +82,16 @@ manifest.version = version;
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 writeFileSync(join(SERVER, 'SOURCE_HASH'), `${pluginSourceHash()}\n`);
 
-process.stdout.write(`built plugin ${version} in plugin/ and its server builds in dist/server/\n`);
+// The desktop app extension, from the plugin just built.
+const DIST_ROOT = join(MCP, '..', 'dist');
+await buildDesktopExtension({ pluginDir: PLUGIN_DIR, version, outFile: join(DIST_ROOT, `wicket-${version}.mcpb`), withLocalServer: false });
+if (process.platform === 'darwin' && process.arch === 'arm64') {
+    await buildDesktopExtension({
+        pluginDir: PLUGIN_DIR,
+        version,
+        outFile: join(DIST_ROOT, `wicket-${version}-local.mcpb`),
+        withLocalServer: true,
+    });
+}
+
+process.stdout.write(`built plugin ${version} in plugin/, its server builds in dist/server/ and the desktop extension in dist/\n`);

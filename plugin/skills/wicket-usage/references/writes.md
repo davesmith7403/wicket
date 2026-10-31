@@ -1,12 +1,12 @@
 # Writing safely
 
-Wicket writes one record per call, through the table's own validation, under the caller's BC permissions, behind a deny-by-default exposure and a per-field policy. The rules below hold on every tenant, whatever its Setup switches enforce: the switches decide whether the server refuses a careless write, never whether a write is safe.
+Wicket writes one record per call, or many in one transaction with `wicket_batch`, always through the table's own validation, under the caller's BC permissions, behind a deny-by-default exposure and a per-field policy. The rules below hold on every tenant, whatever its Setup switches enforce: the switches decide whether the server refuses a careless write, never whether a write is safe.
 
 ## The write contract
 
 1. **Read first.** Get the row with `wicket_query` (select the fields you will change plus any you need to decide) so you hold a fresh `@recordId` and `@etag`, and `wicket_describe summary:true` so you know which fields are writable and what an option field's members are.
 2. **Send the `etag`** on every `wicket_modify` and `wicket_delete`. Without it the write is last-write-wins over anything that changed since your read. A `412 precondition-failed` means the row moved: re-read, re-apply your change to the fresh row, retry with the new `@etag`. A table without system fields (`hasSystemFields: false`) has no etag at all; say so to the user before writing it.
-3. **Send an `idempotencyKey`** on `insert`, `modify`, `delete`, `invoke`, `action` and a `deliver` submit: a fresh unique value per logical request (a UUID, or a name tied to the intent such as `cust-10000-phone-2026-10-14`). Reuse it **only** to retry that exact call after a timeout or a lost response: the retry replays the stored result (`"@replayed": true`) instead of executing again. `wicket_invoke` and `wicket_action` mint one for you when you send none and return it as `@idempotencyKey`; reuse that value verbatim to retry.
+3. **Send an `idempotencyKey`** on `insert`, `modify`, `delete`, `batch`, `invoke`, `action` and a `deliver` submit: a fresh unique value per logical request (a UUID, or a name tied to the intent such as `cust-10000-phone-2026-10-14`). Reuse it **only** to retry that exact call after a timeout or a lost response: the retry replays the stored result (`"@replayed": true`) instead of executing again. `wicket_batch`, `wicket_invoke` and `wicket_action` mint one for you when you send none and return it as `@idempotencyKey`; reuse that value verbatim to retry.
 4. **Send only what changes.** Omit fields you are not changing; never send back a masked rendering (a value listed in the row's `@masked`) — that is `400 masked-value`. Option values as the member name, the ordinal, or `{ "ord": n }`; `null` clears a field.
 5. **Let the triggers run.** `init: false` and `validate: false` are refused on most tenants and skip the business rules you rely on. Primary-key fields cannot change (`pk-immutable`): insert a new record and delete the old one.
 6. **Verify.** Read the row back after the write (one `wicket_query` on the key) and report what changed. For a person who should see or finish the result, add a `wicket_page_url` link to the card page.
@@ -16,9 +16,18 @@ Wicket writes one record per call, through the table's own validation, under the
 
 Final outcomes are stored: successes and the 4xx answers about the request itself (bad input, a missing record, a business failure such as `422 action-failed`). A corrected request therefore needs a **new** key; the old key keeps answering the stored 4xx. Not stored, so the **same** key is resent once the cause is fixed: every 5xx from the read and write planes, and the refusals an administrator can lift (`read-only`, `role-forbidden`, `not-exposed`, `invoke-disabled`, `action-disabled`, `trigger-bypass-disabled`, `async-not-configured`, `too-many-requests`). Exception: a 5xx from `invoke` or `action` settles the key, because the wrapper may have committed; the same-key resend answers `409 idempotency-indeterminate` and you must check the business result before using a new key. A replay is re-authorized: a stored success you may no longer see answers `403 replay-withheld` — the original request **did** complete, so never repeat it under a new key.
 
-## Many records
+## Many records: `wicket_batch`
 
-There is no bulk write. For a batch: resolve all rows first (one query with an `in (...)` filter, or a filtered `wicket_query_all`), then write them one call each with their own etag and key, a few in parallel, and stop at the first unexpected failure rather than ploughing on. Report counts: written, skipped, failed, with the failures' `detail`. For hundreds of rows, say so before starting and ask whether a BC-side batch (a journal, a configuration package) is the better tool.
+A change that spans more than one record goes in **one `wicket_batch`**, not a series of single writes: every item is written or none is, so a failure cannot leave the data half changed.
+
+1. **Read first**, as for one write: resolve every row (one query with an `in (...)` filter, or a filtered `wicket_query_all`) so each modify and delete carries its `@recordId` and `@etag`.
+2. **Build the items** in order: `{ op: "insert"|"modify"|"delete", tableId, recordId?, values?, etag?, validate?, init? }`, the same rules as the single-write tools. Up to 100 items (`capabilities.limits.maxBatchItems`); split larger changes into several batches and say so.
+3. **Link items instead of guessing keys.** A value `{ "fromItem": n, "field": "No." }` (or `"fieldNo"`) is that field of the record item n wrote, read after it ran: create an order header, then its lines with `"Document No.": { "fromItem": 0, "field": "No." }`. `recordId: { "fromItem": n }` targets the record item n created or changed. Only earlier items; the field must be readable in clear (a hidden or masked field is refused).
+4. **Preview first**: the same call with `preview: true` runs every item and rolls everything back. It answers each item's result, or the first failure, and writes nothing; show the user what would change. Then send it without `preview`.
+5. **On a failure nothing was written.** The problem names the item (`item`, `itemOp`, and `detail` starting `items[i] (op, table n)`): fix that item and resend the **whole** batch with a new key.
+6. **Verify and report**: the answer lists each item's `recordId` and new `@etag`; read the rows back and report what changed.
+
+For hundreds of rows, say so before starting and ask whether a BC-side tool (a journal, a configuration package) is the better fit.
 
 ## Business actions (`wicket_action`) and posting
 

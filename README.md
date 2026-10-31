@@ -4,8 +4,8 @@
 
 Wicket lets an agent work with Microsoft Dynamics 365 Business Central: discover the tenant's
 tables and APIs, read and aggregate data, write records with optimistic concurrency and idempotency
-keys, and run named business actions such as posting a document — with a real posting preview
-first. Everything goes through a deny-by-default endpoint inside Business Central: an administrator
+keys (one at a time, or many in one all-or-nothing batch), run named business actions such as
+posting a document — with a real posting preview first — and look back at what the agent changed. Everything goes through a deny-by-default endpoint inside Business Central: an administrator
 decides which tables are exposed, which fields are masked or hidden, and which actions may run.
 
 > **New here?** The [quick start](https://davesmith7403.github.io/wicket-bc/quick-start.html) connects Claude to a customer's Business Central in six steps, from
@@ -15,8 +15,8 @@ This repository is the **agent side** of Wicket:
 
 | Folder | What it is |
 |---|---|
-| [`plugin/`](plugin/) | The plugin: the server launcher for Windows and Mac, the usage skill, and the `/wicket:setup`, `/wicket:orient` and `/wicket:inventory` commands |
-| [`mcp/`](mcp/README.md) | The MCP server source (TypeScript, compiled per platform) and its launcher (Go): 24 `wicket_*` tools, multi-connection, OAuth2 service principal, browser or device-code sign-in |
+| [`plugin/`](plugin/) | The plugin: the server launcher for Windows and Mac, the usage skill, and the `/wicket:setup`, `/wicket:orient` and `/wicket:inventory` commands; the same files make the desktop app extension |
+| [`mcp/`](mcp/README.md) | The MCP server source (TypeScript, compiled per platform) and its launcher (Go): 26 `wicket_*` tools, multi-connection, OAuth2 service principal, browser or device-code sign-in |
 | [`skills/wicket-usage/`](skills/wicket-usage/SKILL.md) | The usage skill: how an agent should orient, filter, write, post and present results |
 | [`docs/`](docs/) | Entra ID setup for the connection, and the single-file edition of the skill |
 
@@ -33,9 +33,9 @@ The repository root is also the plugin's marketplace.
 - Business Central online (BC 26 or later) with the Wicket extension installed
 - A user account with a Wicket permission set, or an Entra ID app registration (service principal) —
   see [docs/setup-entra.md](docs/setup-entra.md)
-- Claude Code on Windows (x64 or arm64) or an Apple-silicon Mac. Nothing else to install: on its
-  first start the plugin downloads its server for your platform from this repository's release and
-  checks it against the checksums it carries.
+- Claude Code or the Claude desktop app, on Windows (x64 or arm64) or an Apple-silicon Mac. Nothing
+  else to install: on its first start Wicket downloads its server for your platform from this
+  repository's release and checks it against the checksums it carries.
 
 ## Install
 
@@ -52,6 +52,16 @@ connection, tests it, and the tools work at once. Run it again to see what is co
 a client secret goes into your computer's own secret store (the Keychain on a Mac, protected for your
 Windows account on Windows) through a one-time page in your browser, never through the
 chat. To write the file by hand instead, see [mcp/README.md](mcp/README.md#connections).
+
+### In the Claude desktop app
+
+Download `wicket-<version>.mcpb` from the
+[latest release](https://github.com/davesmith7403/wicket/releases/latest) and open it: the desktop app
+shows the extension and installs it with one click. Then say **"set up Wicket"** in a chat; the
+same guided setup runs there, and connections are shared with Claude Code on the same machine.
+Pages Claude builds in the desktop app (dashboards, reports) can query Wicket live while you have them open.
+
+### Other hosts
 
 Other MCP hosts can run the server directly — see [mcp/README.md](mcp/README.md) for Claude Desktop
 and standalone setup, and for installing the skill without the plugin.

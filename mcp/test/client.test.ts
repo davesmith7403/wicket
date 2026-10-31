@@ -118,6 +118,20 @@ describe('WicketClient.call request shape', () => {
         expect(new Set(ids).size).toBe(2);
     });
 
+    test('every call carries User-Agent Wicket-MCP/<version> and client-request-id equal to the envelope id', async () => {
+        stub.token().rpc(() => odata({}));
+        const client = new WicketClient(spec());
+
+        await client.call('query', { tableId: 18 });
+        await client.call('changes', {});
+
+        for (const req of stub.rpcRequests) {
+            expect(req.headers['user-agent']).toBe(`Wicket-MCP/${SERVER_VERSION}`);
+            expect(req.headers['client-request-id']).toBe((req.json as { id: string }).id);
+        }
+        expect(stub.rpcRequests[0]!.headers['client-request-id']).not.toBe(stub.rpcRequests[1]!.headers['client-request-id']);
+    });
+
     test('honours a custom baseUrl and strips trailing slashes', async () => {
         stub.token().rpc(() => odata({}));
         const client = new WicketClient(spec({ baseUrl: 'https://bc.contoso.local:7048/BC260///' }));
@@ -469,7 +483,7 @@ describe('WicketClient readOnly guard', () => {
     });
 
     test('the mutating set matches the AL dispatcher list', () => {
-        expect([...MUTATING_OPERATIONS].sort()).toEqual(['action', 'delete', 'insert', 'invoke', 'modify']);
+        expect([...MUTATING_OPERATIONS].sort()).toEqual(['action', 'batch', 'delete', 'insert', 'invoke', 'modify']);
     });
 });
 

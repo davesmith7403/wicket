@@ -15,7 +15,7 @@ Wicket fronts Microsoft Dynamics 365 Business Central: the wicket_* tools read, 
 - Filters: double-quote a field name unless it is plain [A-Za-z0-9_] ("No." eq '10000', "Posting Date" ge 2025-01-01); options by ordinal ("Document Type" eq 1); dates bare, strings in single quotes; no cross-field or (split it); contains() is case-sensitive.
 - Read only what you need: select the fields; aggregate for totals on stored fields (a FlowField such as Balance (LCY) is refused: sum the ledger instead); count:true to count; top for samples; wicket_query_all with maxRows from the count for exports, no orderBy.
 - Masked values (@masked, ****) are display text: never filter, sort, compute on or write them back.
-- Writes: one record per call; modify/delete with the row's @etag and an idempotencyKey; read it back; post via wicket_action, preview: true first; never edit a document's fields around a refused action.
+- Writes: modify/delete with the row's @etag + idempotencyKey; many records → one wicket_batch; post via wicket_action; preview: true first; read back; never edit a document's fields around a refused action.
 - Beyond a dozen rows present outside the chat: a file for Excel, an artifact page or dashboard, a doc for a shared report, wicket_page_url (card pageId) for a record a person acts on.
 - Small independent reads in parallel; heavy ones (1000-row discover, cold describe) one at a time. On an error read detail and suggest; retry a timed-out read once.
 - Installed apps may do more: before saying Wicket cannot, or when the map has no solution notes, offer to explore them (read-only, on a yes).
@@ -75,7 +75,7 @@ Details, inputs and result shapes for every tool: [tools](references/tools.md).
 
 ## Writing safely
 
-Read the row first; send `etag` on `modify`/`delete` and a fresh `idempotencyKey` on every write; send only the fields that change; never echo a masked rendering; verify by reading back; one record per call, a few in parallel for a batch, stop on the first unexpected failure. Posting commits at once and is never rolled back by Wicket: run the same call with `preview: true` first (it returns the entries, or why it would fail, and never posts), and never post twice. Full rules, replay semantics and the posting checklist: [writes](references/writes.md).
+Read the row first; send `etag` on `modify`/`delete` and a fresh `idempotencyKey` on every write; send only the fields that change; never echo a masked rendering; verify by reading back. A change to several records goes in one `wicket_batch` (all or nothing, `preview: true` first, items can reference earlier items). Posting commits at once and is never rolled back by Wicket: run the same call with `preview: true` first (it returns the entries, or why it would fail, and never posts), and never post twice. Full rules, replay semantics and the posting checklist: [writes](references/writes.md).
 
 ## Presenting
 
@@ -160,6 +160,10 @@ Updates one record by `recordId`: send `etag` from your most recent read of the 
 
 Deletes one record by `recordId` with `etag` and an `idempotencyKey`. Returns `{ deleted: true, recordId }`.
 
+## wicket_batch
+
+Inserts, modifies and deletes up to 100 records (any tables) in one transaction: all are written or none. Items are `{ op, tableId, recordId?, values?, etag?, validate?, init? }`; a value `{ fromItem: n, field }` or a `recordId: { fromItem: n }` uses an earlier item's record. `preview: true` runs everything and rolls back. A failure names the item (`item`, `itemOp`, `detail` from `items[i]`) and writes nothing. Returns `{ items: [ { index, op, recordId, @etag? } ], count, preview? }`. Mints an `@idempotencyKey` when you send none. Workflow: `references/writes.md`, "Many records".
+
 ## wicket_invoke
 
 Runs one procedure enrolled in the Wicket Procedure Catalog (`codeunitId`, `procedure`, `args` object). Nothing else is callable, whatever `wicket_discover` lists: `wicket_describe kind:"codeunit"` is the only source of truth. Synchronous. When you send no `idempotencyKey` the server mints one and returns it as `@idempotencyKey`: reuse it verbatim to retry the same call. Prefer `wicket_action` for business operations such as posting.
@@ -179,6 +183,10 @@ The lifecycle projection of one async request (`queued`, `scheduled`, `running`,
 ## wicket_requests
 
 Your own async requests, newest first, optionally filtered by `status`, `top` up to 100. Caller-scoped: nobody else's requests are ever visible.
+
+## wicket_changes
+
+What the agent created, changed or deleted through Wicket, and the actions and procedures it ran, newest first: each entry with `kind`, the table and record, the user and connection, and per field `old` → `new` with `shownAs` (`clear`, `masked` as the stored mask, `hidden` without values). Filters: `from`/`to` (ISO date-times), `tableId`, `viaConnection`, `kind` (`created`, `changed`, `deleted`, `action`, `procedure`), `top` up to 100, `cursor` from `@nextLink`. Your own changes only; `user` and everyone's entries need the **Wicket - Audit Changes** permission set. Use it for "what did you (or the agent) change …" questions and present the answer as a report or a file, not a long chat list. Knock-on changes in other records (a posting's entries, a recalculated header) are not listed: BC's Change Log has those. `403 changes-off` means the history is off on the Wicket Setup card.
 
 ## wicket_cancel
 
@@ -282,6 +290,8 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `select-and-selectFieldNo` / `invalid-select` | Both select forms, or `"*"` mixed with names | One form; `"*"` alone |
 | `invalid-aggregate` | Aggregate combined with a row-plane key, an unknown key, or `sum`/`avg` on a FlowField or non-numeric field | Aggregate with `filter` only; sum the stored field of the table the FlowField is computed from (`references/tables.md`) |
 | `invalid-orderby` | Mixed directions, or fields that match no key | One direction; a key from `describe`, or no `orderBy` and client-side sort |
+| `batch-too-large` | A `batch` with more than `capabilities.limits.maxBatchItems` (100) items | Split it into several batches |
+| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, or a field that does not exist | Reference only earlier items that wrote a record; take the field name from `describe` |
 | `invalid-cursor` | A cursor from another table, query shape or connection | Pass `@nextLink` back unchanged with the same query, or restart |
 | `record-table-mismatch` | A `recordId` from another table | Re-query the right table |
 | `not-binary` | `readBlob` on a non-binary field | A `BLOB`/`Media` field from `describe` |
@@ -310,6 +320,8 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `invoke-disabled` / `action-disabled` | Enrolled, but `Allow Run` is off | An administrator enables it; the same idempotency key can then be reused |
 | `async-not-configured` | `deliver` on a tenant without a usable async configuration | Read inline or page; an administrator completes the setup |
 | `replay-withheld` | A resend under a key whose original request completed, but whose stored result you may no longer see (`originalStatus`, `reason`) | It already happened: never repeat it under a new key |
+| `changes-off` | `changes` while the change history is off, or not readable by the agent, on the Wicket Setup card | Say so; an administrator turns it on (Change History). The Wicket Changes page in BC still shows what was recorded |
+| `changes-forbidden` | `changes` with `user` without the Wicket - Audit Changes permission set | Omit `user` to see your own changes; an administrator assigns the set for everyone's |
 | `api-not-routable` (MCP) | `wicket_api_read` while routing is `Off` or the source table is not readable | `wicket_query` on `suggest.tableId` |
 
 ## Not found (404)
@@ -323,7 +335,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `no-page` | `pageUrl` on a table without a default lookup page | Pass `pageId` |
 | `empty-blob` | The media field has no content | Nothing to fetch |
 | `unknown-request` | An async request that is unknown, malformed or not yours | A `requestId` from your own submit or `wicket_requests` |
-| `unknown-operation` | The operation name is not one of the sixteen (HTTP clients) | One of `suggest`'s operations |
+| `unknown-operation` | The operation name is not one of the eighteen (HTTP clients) | One of `suggest`'s operations |
 | `unknown-section` | `skill` section matching no `## ` heading | A title from `suggest.sections` |
 | `skill-not-configured` | The endpoint has no hosted guide | Irrelevant through MCP: `wicket_skill` is local |
 
@@ -374,13 +386,13 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 
 # Writing safely
 
-Wicket writes one record per call, through the table's own validation, under the caller's BC permissions, behind a deny-by-default exposure and a per-field policy. The rules below hold on every tenant, whatever its Setup switches enforce: the switches decide whether the server refuses a careless write, never whether a write is safe.
+Wicket writes one record per call, or many in one transaction with `wicket_batch`, always through the table's own validation, under the caller's BC permissions, behind a deny-by-default exposure and a per-field policy. The rules below hold on every tenant, whatever its Setup switches enforce: the switches decide whether the server refuses a careless write, never whether a write is safe.
 
 ## The write contract
 
 1. **Read first.** Get the row with `wicket_query` (select the fields you will change plus any you need to decide) so you hold a fresh `@recordId` and `@etag`, and `wicket_describe summary:true` so you know which fields are writable and what an option field's members are.
 2. **Send the `etag`** on every `wicket_modify` and `wicket_delete`. Without it the write is last-write-wins over anything that changed since your read. A `412 precondition-failed` means the row moved: re-read, re-apply your change to the fresh row, retry with the new `@etag`. A table without system fields (`hasSystemFields: false`) has no etag at all; say so to the user before writing it.
-3. **Send an `idempotencyKey`** on `insert`, `modify`, `delete`, `invoke`, `action` and a `deliver` submit: a fresh unique value per logical request (a UUID, or a name tied to the intent such as `cust-10000-phone-2026-10-14`). Reuse it **only** to retry that exact call after a timeout or a lost response: the retry replays the stored result (`"@replayed": true`) instead of executing again. `wicket_invoke` and `wicket_action` mint one for you when you send none and return it as `@idempotencyKey`; reuse that value verbatim to retry.
+3. **Send an `idempotencyKey`** on `insert`, `modify`, `delete`, `batch`, `invoke`, `action` and a `deliver` submit: a fresh unique value per logical request (a UUID, or a name tied to the intent such as `cust-10000-phone-2026-10-14`). Reuse it **only** to retry that exact call after a timeout or a lost response: the retry replays the stored result (`"@replayed": true`) instead of executing again. `wicket_batch`, `wicket_invoke` and `wicket_action` mint one for you when you send none and return it as `@idempotencyKey`; reuse that value verbatim to retry.
 4. **Send only what changes.** Omit fields you are not changing; never send back a masked rendering (a value listed in the row's `@masked`) — that is `400 masked-value`. Option values as the member name, the ordinal, or `{ "ord": n }`; `null` clears a field.
 5. **Let the triggers run.** `init: false` and `validate: false` are refused on most tenants and skip the business rules you rely on. Primary-key fields cannot change (`pk-immutable`): insert a new record and delete the old one.
 6. **Verify.** Read the row back after the write (one `wicket_query` on the key) and report what changed. For a person who should see or finish the result, add a `wicket_page_url` link to the card page.
@@ -390,9 +402,18 @@ Wicket writes one record per call, through the table's own validation, under the
 
 Final outcomes are stored: successes and the 4xx answers about the request itself (bad input, a missing record, a business failure such as `422 action-failed`). A corrected request therefore needs a **new** key; the old key keeps answering the stored 4xx. Not stored, so the **same** key is resent once the cause is fixed: every 5xx from the read and write planes, and the refusals an administrator can lift (`read-only`, `role-forbidden`, `not-exposed`, `invoke-disabled`, `action-disabled`, `trigger-bypass-disabled`, `async-not-configured`, `too-many-requests`). Exception: a 5xx from `invoke` or `action` settles the key, because the wrapper may have committed; the same-key resend answers `409 idempotency-indeterminate` and you must check the business result before using a new key. A replay is re-authorized: a stored success you may no longer see answers `403 replay-withheld` — the original request **did** complete, so never repeat it under a new key.
 
-## Many records
+## Many records: `wicket_batch`
 
-There is no bulk write. For a batch: resolve all rows first (one query with an `in (...)` filter, or a filtered `wicket_query_all`), then write them one call each with their own etag and key, a few in parallel, and stop at the first unexpected failure rather than ploughing on. Report counts: written, skipped, failed, with the failures' `detail`. For hundreds of rows, say so before starting and ask whether a BC-side batch (a journal, a configuration package) is the better tool.
+A change that spans more than one record goes in **one `wicket_batch`**, not a series of single writes: every item is written or none is, so a failure cannot leave the data half changed.
+
+1. **Read first**, as for one write: resolve every row (one query with an `in (...)` filter, or a filtered `wicket_query_all`) so each modify and delete carries its `@recordId` and `@etag`.
+2. **Build the items** in order: `{ op: "insert"|"modify"|"delete", tableId, recordId?, values?, etag?, validate?, init? }`, the same rules as the single-write tools. Up to 100 items (`capabilities.limits.maxBatchItems`); split larger changes into several batches and say so.
+3. **Link items instead of guessing keys.** A value `{ "fromItem": n, "field": "No." }` (or `"fieldNo"`) is that field of the record item n wrote, read after it ran: create an order header, then its lines with `"Document No.": { "fromItem": 0, "field": "No." }`. `recordId: { "fromItem": n }` targets the record item n created or changed. Only earlier items; the field must be readable in clear (a hidden or masked field is refused).
+4. **Preview first**: the same call with `preview: true` runs every item and rolls everything back. It answers each item's result, or the first failure, and writes nothing; show the user what would change. Then send it without `preview`.
+5. **On a failure nothing was written.** The problem names the item (`item`, `itemOp`, and `detail` starting `items[i] (op, table n)`): fix that item and resend the **whole** batch with a new key.
+6. **Verify and report**: the answer lists each item's `recordId` and new `@etag`; read the rows back and report what changed.
+
+For hundreds of rows, say so before starting and ask whether a BC-side tool (a journal, a configuration package) is the better fit.
 
 ## Business actions (`wicket_action`) and posting
 
@@ -450,12 +471,12 @@ Whatever the medium: state the connection and company, the filter, the as-of tim
 
 Load the `artifact-design` skill (page contract: title, theme tokens for light and dark, allowed CDNs, size) and the `dataviz` skill (charts, stat tiles, palette) before writing the page; a generic dashboard template conflicts with the artifact contract (it ships a doctype, cycles colours and is light-only), so follow those two skills. The rules that matter most for BC data: one sequential palette by default and categorical colours only when series identity is the point (at most seven); status colours (good, warning, serious, critical) reserved for status and always paired with a label; bars from zero; compact ticks (`1K`, `2.4M`); tabular numerals in columns; no dual-axis charts; a table view behind every chart; a filter row above the charts that re-renders all of them. Take one look at the result before handing it over.
 
-In Claude Code, start with the Artifact tool's `quickstart` for the intent (`other` for a dashboard or data page): the account may list typed artifacts such as a Dashboard, which brings its own store, sources panel and design defaults, and the quickstart returns the page-design guidance you would otherwise load by hand. A typed Dashboard's live queries run from the reader's browser through a claude.ai connector, which a local Wicket server is not: attach the rows as a dataset snapshot, say when it was taken, and offer to refresh it.
+In Claude Code, start with the Artifact tool's `quickstart` for the intent (`other` for a dashboard or data page): the account may list typed artifacts such as a Dashboard, which brings its own store, sources panel and design defaults, and the quickstart returns the page-design guidance you would otherwise load by hand. A typed Dashboard's live queries run from the reader's browser through a claude.ai connector, which a local Wicket server is not: attach the rows as a dataset snapshot, say when it was taken, and offer to refresh it. When the user wants the numbers to stay current, build a plain page that calls Wicket live instead (below), never answer that a dashboard cannot query Wicket.
 
 Three kinds of page, by freshness:
 
 - **Snapshot** (the default): the data is embedded at publish time; say when it was taken; republish to refresh.
-- **Live**: in Claude Code, a page can call Wicket itself through the `mcp` capability — `capabilities: { mcp: { servers: [{ server: "host:wicket", tools: ["wicket_query"] }] } }` (list every tool the page calls; an empty list is refused). It answers only for the artifact's owner, opened inside the Claude app with the same local Wicket server connected (a browser tab gets `server_not_connected`); use `watchTool` for reads (refetch at 30 s or slower), show `result.cache.storedAt` as the last-updated time, and let each section fail on its own. Read tools only. In claude.ai, an artifact can call a remote connector but never a local server. Load the `artifact-capabilities` skill before declaring any capability.
+- **Live** (proven 2026-10-30): a plain page calls Wicket itself through the `mcp` capability with a host server. The name is the local server's name in the app that opens the page, which is not always the name this session uses: the desktop app's own entry is usually `wicket` (`host:wicket`), a Claude Code plugin's is `plugin_wicket_wicket`. Declare both, each with every tool the page calls — `capabilities: { mcp: { servers: [{ server: "host:wicket", tools: ["wicket_query"] }, { server: "host:plugin_wicket_wicket", tools: ["wicket_query"] }] } }` (an empty list is refused) — and use the first that answers. It works only for the artifact's owner, opened inside the Claude desktop app with Wicket connected there; in a browser tab the page sees no host server and every call is `server_not_connected`. So embed the snapshot too and show it, marked with its time, whenever no host answers; tell the user to open the page in the desktop app for live data. Use `watchTool` for reads (`refetchInterval` 60 s or slower; the first call can take a few seconds), show `result.cache.storedAt` (or the receipt time) as the last-updated time, and let each section fail on its own with its error code. Read tools only (`wicket_query`, `wicket_query_all`, `wicket_whoami`); a page never writes. Load the `artifact-capabilities` skill before declaring any capability.
 - **Persistent**: the `db` capability plus the `ArtifactData` tool let Claude push fresh rows into the page's own store (a `/loop` or a nightly job republishing the data) while viewers share one state; design the empty state and seed the store after the first publish. The `downloads` capability hands the viewer a CSV or XLSX of what they see.
 
 A page is private until shared; a page that calls a connector or reads policy-masked data carries that data to whoever it is shared with. Say so when you publish.
@@ -739,7 +760,7 @@ Authorization: Bearer <Entra ID JWT>
 Content-Type: application/json
 ```
 
-`wicketEndpoint(0)` and the `Microsoft.NAV.` prefix are literal. `{operation}` is one of `discover`, `describe`, `query`, `readBlob`, `insert`, `modify`, `delete`, `invoke`, `capabilities`, `status`, `cancel`, `requests`, `action`, `skill`, `pageUrl`, `whoAmI`. `{companyId}` is the company GUID from the standard `/companies` endpoint.
+`wicketEndpoint(0)` and the `Microsoft.NAV.` prefix are literal. `{operation}` is one of `discover`, `describe`, `query`, `readBlob`, `insert`, `modify`, `delete`, `batch`, `invoke`, `capabilities`, `status`, `cancel`, `requests`, `changes`, `action`, `skill`, `pageUrl`, `whoAmI`. `{companyId}` is the company GUID from the standard `/companies` endpoint.
 
 ## Transport: always 200, one string in, one string out
 
@@ -772,11 +793,13 @@ A real non-200 HTTP status comes from the BC gateway before the action ran: 401 
 | `insert` | `{ tableId, values|valuesByFieldNo, init? }` → `{ recordId, @etag? }` |
 | `modify` | `{ tableId, recordId, values|valuesByFieldNo, etag?, validate? }` → `{ recordId, @etag? }` |
 | `delete` | `{ tableId, recordId, etag? }` → `{ deleted: true, recordId }` |
+| `batch` | `{ items: [ { op: "insert"|"modify"|"delete", tableId, recordId? | { fromItem }, values? (a value may be { fromItem, field | fieldNo }), valuesByFieldNo?, etag?, validate?, init? } ], preview? }` → `{ items: [ { index, op, recordId, @etag? | deleted } ], count, preview? }`; one transaction, at most 100 items |
 | `invoke` | `{ codeunitId, procedure, args?, returnShape? }` |
 | `action` | `{ action, target?: { systemId }, args?, preview? }` |
 | `capabilities` / `whoAmI` | `{}` |
 | `status` / `cancel` | `{ requestId }` |
 | `requests` | `{ status?, top? }` |
+| `changes` | `{ from?, to?, tableId?, viaConnection?, kind?, user?, top?, cursor? }` → `{ value: [ { entryNo, createdAt, kind, tableId, tableName, recordKey, systemId?, user, connection, requestId, name?, outcome?, result?, fieldCount, fields: [ { fieldNo, fieldName, shownAs, old?, new?, truncated? } ] } ], @nextLink? }` |
 | `pageUrl` | `{ table: "Customer"|"#18", systemId?|recordId?, pageId? }` → `{ pageUrl, pageId }` |
 | `skill` | `{ mode?: "toc"|"section"|"full", section? }` — serves the document hosted at the tenant's *Skill Doc Url* (the single-file bundle of this guide) |
 

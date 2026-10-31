@@ -12,7 +12,7 @@ Authorization: Bearer <Entra ID JWT>
 Content-Type: application/json
 ```
 
-`wicketEndpoint(0)` and the `Microsoft.NAV.` prefix are literal. `{operation}` is one of `discover`, `describe`, `query`, `readBlob`, `insert`, `modify`, `delete`, `invoke`, `capabilities`, `status`, `cancel`, `requests`, `action`, `skill`, `pageUrl`, `whoAmI`. `{companyId}` is the company GUID from the standard `/companies` endpoint.
+`wicketEndpoint(0)` and the `Microsoft.NAV.` prefix are literal. `{operation}` is one of `discover`, `describe`, `query`, `readBlob`, `insert`, `modify`, `delete`, `batch`, `invoke`, `capabilities`, `status`, `cancel`, `requests`, `changes`, `action`, `skill`, `pageUrl`, `whoAmI`. `{companyId}` is the company GUID from the standard `/companies` endpoint.
 
 ## Transport: always 200, one string in, one string out
 
@@ -45,11 +45,13 @@ A real non-200 HTTP status comes from the BC gateway before the action ran: 401 
 | `insert` | `{ tableId, values|valuesByFieldNo, init? }` → `{ recordId, @etag? }` |
 | `modify` | `{ tableId, recordId, values|valuesByFieldNo, etag?, validate? }` → `{ recordId, @etag? }` |
 | `delete` | `{ tableId, recordId, etag? }` → `{ deleted: true, recordId }` |
+| `batch` | `{ items: [ { op: "insert"|"modify"|"delete", tableId, recordId? | { fromItem }, values? (a value may be { fromItem, field | fieldNo }), valuesByFieldNo?, etag?, validate?, init? } ], preview? }` → `{ items: [ { index, op, recordId, @etag? | deleted } ], count, preview? }`; one transaction, at most 100 items |
 | `invoke` | `{ codeunitId, procedure, args?, returnShape? }` |
 | `action` | `{ action, target?: { systemId }, args?, preview? }` |
 | `capabilities` / `whoAmI` | `{}` |
 | `status` / `cancel` | `{ requestId }` |
 | `requests` | `{ status?, top? }` |
+| `changes` | `{ from?, to?, tableId?, viaConnection?, kind?, user?, top?, cursor? }` → `{ value: [ { entryNo, createdAt, kind, tableId, tableName, recordKey, systemId?, user, connection, requestId, name?, outcome?, result?, fieldCount, fields: [ { fieldNo, fieldName, shownAs, old?, new?, truncated? } ] } ], @nextLink? }` |
 | `pageUrl` | `{ table: "Customer"|"#18", systemId?|recordId?, pageId? }` → `{ pageUrl, pageId }` |
 | `skill` | `{ mode?: "toc"|"section"|"full", section? }` — serves the document hosted at the tenant's *Skill Doc Url* (the single-file bundle of this guide) |
 

@@ -58,6 +58,10 @@ Updates one record by `recordId`: send `etag` from your most recent read of the 
 
 Deletes one record by `recordId` with `etag` and an `idempotencyKey`. Returns `{ deleted: true, recordId }`.
 
+## wicket_batch
+
+Inserts, modifies and deletes up to 100 records (any tables) in one transaction: all are written or none. Items are `{ op, tableId, recordId?, values?, etag?, validate?, init? }`; a value `{ fromItem: n, field }` or a `recordId: { fromItem: n }` uses an earlier item's record. `preview: true` runs everything and rolls back. A failure names the item (`item`, `itemOp`, `detail` from `items[i]`) and writes nothing. Returns `{ items: [ { index, op, recordId, @etag? } ], count, preview? }`. Mints an `@idempotencyKey` when you send none. Workflow: `references/writes.md`, "Many records".
+
 ## wicket_invoke
 
 Runs one procedure enrolled in the Wicket Procedure Catalog (`codeunitId`, `procedure`, `args` object). Nothing else is callable, whatever `wicket_discover` lists: `wicket_describe kind:"codeunit"` is the only source of truth. Synchronous. When you send no `idempotencyKey` the server mints one and returns it as `@idempotencyKey`: reuse it verbatim to retry the same call. Prefer `wicket_action` for business operations such as posting.
@@ -77,6 +81,10 @@ The lifecycle projection of one async request (`queued`, `scheduled`, `running`,
 ## wicket_requests
 
 Your own async requests, newest first, optionally filtered by `status`, `top` up to 100. Caller-scoped: nobody else's requests are ever visible.
+
+## wicket_changes
+
+What the agent created, changed or deleted through Wicket, and the actions and procedures it ran, newest first: each entry with `kind`, the table and record, the user and connection, and per field `old` → `new` with `shownAs` (`clear`, `masked` as the stored mask, `hidden` without values). Filters: `from`/`to` (ISO date-times), `tableId`, `viaConnection`, `kind` (`created`, `changed`, `deleted`, `action`, `procedure`), `top` up to 100, `cursor` from `@nextLink`. Your own changes only; `user` and everyone's entries need the **Wicket - Audit Changes** permission set. Use it for "what did you (or the agent) change …" questions and present the answer as a report or a file, not a long chat list. Knock-on changes in other records (a posting's entries, a recalculated header) are not listed: BC's Change Log has those. `403 changes-off` means the history is off on the Wicket Setup card.
 
 ## wicket_cancel
 

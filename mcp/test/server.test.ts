@@ -89,7 +89,9 @@ describe('tool inventory', () => {
                 'wicket_api_read',
                 'wicket_apis',
                 'wicket_cancel',
+                'wicket_batch',
                 'wicket_capabilities',
+                'wicket_changes',
                 'wicket_connections',
                 'wicket_delete',
                 'wicket_describe',
@@ -131,7 +133,7 @@ describe('tool inventory', () => {
         expect(ann('wicket_invoke')).toMatchObject({ destructiveHint: true });
         expect(ann('wicket_cancel')).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
         expect(ann('wicket_use')).toMatchObject({ readOnlyHint: false, idempotentHint: true });
-        for (const name of ['wicket_discover', 'wicket_describe', 'wicket_read_blob', 'wicket_capabilities', 'wicket_page_url', 'wicket_whoami', 'wicket_status', 'wicket_requests', 'wicket_skill', 'wicket_connections', 'wicket_query_all', 'wicket_apis', 'wicket_api_read']) {
+        for (const name of ['wicket_discover', 'wicket_describe', 'wicket_read_blob', 'wicket_capabilities', 'wicket_page_url', 'wicket_whoami', 'wicket_status', 'wicket_requests', 'wicket_changes', 'wicket_skill', 'wicket_connections', 'wicket_query_all', 'wicket_apis', 'wicket_api_read']) {
             expect(ann(name).readOnlyHint).toBe(true);
         }
         // Async delivery writes a request row + a shareable blob package: never auto-approvable.

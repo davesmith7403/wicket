@@ -23,6 +23,7 @@ problem) for the agent.
 | `wicket_read_blob` | `readBlob` | Fetch one binary field as `{ contentType, bytesBase64 }` |
 | `wicket_insert` | `insert` | Create one record (optional `idempotencyKey`) |
 | `wicket_modify` | `modify` | Update one record (optimistic concurrency via `etag`; optional `idempotencyKey`) |
+| `wicket_batch` | `batch` | Many inserts, modifies and deletes in one transaction (all or nothing, up to 100); `preview: true` first; items may use an earlier item's record (`{ fromItem, field }`); mints an idempotency key |
 | `wicket_delete` | `delete` | Delete one record (optimistic concurrency via `etag`; optional `idempotencyKey`) |
 | `wicket_invoke` | `invoke` | Run an enrolled AL procedure (deny-by-default; optional `idempotencyKey`) |
 | `wicket_action` | `action` | Run a named business action (posting etc.) from the deny-by-default Action Catalog (optional `idempotencyKey`) |
@@ -32,6 +33,7 @@ problem) for the agent.
 | `wicket_status` | `status` | Track one async delivery request by `requestId` (caller-scoped) |
 | `wicket_cancel` | `cancel` | Cancel one async delivery request by `requestId` (caller-scoped) |
 | `wicket_requests` | `requests` | List your own async delivery requests (`status?`, `top?`) |
+| `wicket_changes` | `changes` | What the agent created, changed or deleted, and the actions it ran, old → new per field as the field policy allows (`from?`, `to?`, `tableId?`, `viaConnection?`, `kind?`, `user?` with Wicket - Audit Changes, `top?`, `cursor?`) |
 | `wicket_query_all` | `query` (looped) | Convenience: page a `query` to completion, concatenating every page up to `maxPages` / `maxRows` (no `aggregate`, no `deliver`) |
 | `wicket_connections` | — (local) | List the configured connections (name, tenant, environment, company, `authMode`, default, selected), plus any load `problem` and `rejected` entries |
 | `wicket_setup` | — (local, Entra, BC admin APIs) | Guided setup: `status` (silent health check), `locate` (tenant from a BC address, email or domain), `signin`, `environments`, `companies`, `save` (writes and tests the connection, live, no restart), `remove`, `setDefault`, `moveAsideBroken`. Driven by `/wicket:setup` in Claude Code |
@@ -375,7 +377,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.5.0+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.6.0+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -808,7 +810,11 @@ Or add it directly to `.mcp.json` / your Claude Code settings:
 
 ### Claude Desktop
 
-Edit `claude_desktop_config.json` (macOS:
+The simplest route is the desktop app extension: `bun run plugin:build` writes
+`dist/wicket-<version>.mcpb` (each release carries it too); open it and the app installs Wicket
+with one click, the same launcher and skill the plugin uses, set up with "set up Wicket" in a chat.
+
+To run the server from source instead, edit `claude_desktop_config.json` (macOS:
 `~/Library/Application Support/Claude/claude_desktop_config.json`) and add:
 
 ```json

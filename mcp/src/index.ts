@@ -89,7 +89,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.5.0';
+export const SERVER_VERSION = '2.6.0';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -100,7 +100,7 @@ export const RPC_TIMEOUT_MS = 120_000;
  * AL IsMutatingRequest, an `action` that runs inside Wicket's forced rollback — a preview, or a
  * verb whose capabilities entry says `mutating: false` — is let through: its writes are rolled back.
  */
-export const MUTATING_OPERATIONS: ReadonlySet<string> = new Set(['insert', 'modify', 'delete', 'invoke', 'action']);
+export const MUTATING_OPERATIONS: ReadonlySet<string> = new Set(['insert', 'modify', 'delete', 'batch', 'invoke', 'action']);
 
 /**
  * Read operations that honour a per-request `"unmask": false` (field masking). The single
@@ -265,7 +265,13 @@ export class WicketClient {
             this.operationUrl(operation),
             {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                // User-Agent and client-request-id land in BC's own web-service telemetry (RT0008), so its
+                // Power BI apps can filter Wicket traffic and tie one call to its Operation Log entry.
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': `Wicket-MCP/${SERVER_VERSION}`,
+                    'client-request-id': envelope.id as string,
+                },
                 // BC publishes a bound action only for simple parameter types, so the envelope
                 // travels as ONE JSON string in the action's `envelope` parameter, and the result
                 // comes back as one JSON string in `value` (parsed below).
@@ -472,6 +478,8 @@ export class WicketClient {
      * catalog row the server consults.
      */
     private async runsInRollback(operation: string, data: Record<string, unknown>): Promise<boolean> {
+        // A batch preview runs every item inside the server's forced rollback (Bcmag Batch Rollback).
+        if (operation === 'batch') return data.preview === true;
         if (operation !== 'action') return false;
         if (data.preview === true) return true;
         const verb = typeof data.action === 'string' ? data.action.toLowerCase() : '';
@@ -638,7 +646,7 @@ export function truncate(s: string, max: number): string {
 
 /** Render a successful result as an MCP text content block. */
 /** Operations whose calls get a server-minted idempotency key when the agent sends none. */
-export const AUTO_KEY_OPERATIONS: ReadonlySet<string> = new Set(['invoke', 'action']);
+export const AUTO_KEY_OPERATIONS: ReadonlySet<string> = new Set(['invoke', 'action', 'batch']);
 
 /** Report a server-minted key next to the result, so a retry of the same call can reuse it. */
 export function withGeneratedKey(result: unknown, key: string): unknown {
@@ -717,6 +725,7 @@ export const TOOL_NAMES = [
     'wicket_insert',
     'wicket_modify',
     'wicket_delete',
+    'wicket_batch',
     'wicket_invoke',
     'wicket_action',
     'wicket_capabilities',
@@ -725,6 +734,7 @@ export const TOOL_NAMES = [
     'wicket_status',
     'wicket_cancel',
     'wicket_requests',
+    'wicket_changes',
     'wicket_apis',
     'wicket_api_read',
     'wicket_map',
@@ -1048,6 +1058,41 @@ const deleteSchema = {
     idempotencyKey: IdempotencyKey,
 };
 
+// A value or recordId inside a batch item may reference an earlier item of the same batch.
+const BatchItem = z
+    .object({
+        op: z.enum(['insert', 'modify', 'delete']).describe('What this item does.'),
+        tableId: z.number().int().describe('Table of this item.'),
+        recordId: z
+            .union([z.string(), z.object({ fromItem: z.number().int() })])
+            .optional()
+            .describe(
+                'modify/delete: the @recordId from a read, or { fromItem: n } for the record an earlier item of this ' +
+                    'batch created or changed.',
+            ),
+        values: ValuesObject.optional().describe(
+            'Field values by name. A value may be { fromItem: n, field: "<name>" } (or fieldNo): that field of the ' +
+                'record an earlier item wrote, read after it ran — e.g. an order header\'s "No." for its lines.',
+        ),
+        valuesByFieldNo: ValuesObject.optional().describe('Field values keyed by field number (stringified).'),
+        etag: z.string().optional().describe('modify/delete: @etag from your most recent read of the row.'),
+        validate: z.boolean().optional().describe('modify: run field validation (OnValidate). Defaults to true.'),
+        init: z.boolean().optional().describe('insert: run the insert trigger (OnInsert). Defaults to true.'),
+    })
+    .describe('One write, in the shape of wicket_insert / wicket_modify / wicket_delete plus "op".');
+
+const batchSchema = {
+    items: z
+        .array(BatchItem)
+        .min(1)
+        .describe('The writes, in order (at most capabilities.limits.maxBatchItems, 100). All are written or none.'),
+    preview: z
+        .boolean()
+        .optional()
+        .describe('Run every item, then roll everything back: check a batch before writing it. Writes nothing.'),
+    idempotencyKey: IdempotencyKey,
+};
+
 const invokeSchema = {
     codeunitId: z.number().int().describe('Codeunit hosting the enrolled procedure.'),
     procedure: z.string().describe('Enrolled procedure name (see describe kind=codeunit).'),
@@ -1139,6 +1184,29 @@ const statusSchema = {
 
 const cancelSchema = {
     requestId: z.string().describe('The requestId of the async request to cancel.'),
+};
+
+const changesSchema = {
+    from: z.string().optional().describe('ISO 8601 date-time: entries at or after it.'),
+    to: z.string().optional().describe('ISO 8601 date-time: entries at or before it.'),
+    tableId: z.number().int().positive().optional().describe('Only changes to this table.'),
+    viaConnection: z
+        .string()
+        .optional()
+        .describe('Only changes made through this named connection (as the history records it, e.g. "contoso-sandbox").'),
+    kind: z
+        .enum(['created', 'changed', 'deleted', 'action', 'procedure'])
+        .optional()
+        .describe('Only this kind of entry.'),
+    user: z
+        .string()
+        .optional()
+        .describe(
+            'Only this BC user\'s changes. Needs the Wicket - Audit Changes permission set (403 changes-forbidden ' +
+                'without it); omit it to see your own changes.',
+        ),
+    top: z.number().int().positive().optional().describe('Max entries, newest first (default 20, capped at 100).'),
+    cursor: z.string().optional().describe('The previous answer\'s @nextLink, unchanged, with the same filters.'),
 };
 
 const requestsSchema = {
@@ -1427,6 +1495,24 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
     );
 
     tool(
+        'wicket_batch',
+        'Write many records in one transaction',
+        'Insert, modify and delete many records (up to 100, any tables) in ONE call and ONE transaction: every ' +
+            'item is written or none is. Use it instead of a series of single writes whenever a change spans more ' +
+            'than one record — a price list, an order with its lines — so a failure cannot leave the data half ' +
+            'changed. Each item is { op: "insert"|"modify"|"delete", tableId, recordId?, values?, etag?, validate?, ' +
+            'init? } with the same rules as the single-write tools. A later item can use an earlier one\'s result: ' +
+            '{ fromItem: n, field: "No." } as a value, { fromItem: n } as a recordId. Run it with preview: true ' +
+            'first: everything runs and rolls back, so you see each item\'s result or the first failure without ' +
+            'writing. On a failure nothing is written and the problem names the item (item, itemOp; detail starts ' +
+            '"items[i]"): fix that item and resend the whole batch. Returns { items: [ { index, op, recordId, ' +
+            '@etag? } ], count }. A key is minted when you send none (@idempotencyKey): reuse it to retry.',
+        'batch',
+        batchSchema,
+        UPDATE_ANNOTATIONS,
+    );
+
+    tool(
         'wicket_invoke',
         'Invoke an enrolled procedure',
         'Run one AL procedure enrolled in the Wicket Procedure Catalog (deny-by-default): only the procedures ' +
@@ -1540,6 +1626,20 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
             'caller-scoped: only requests you submitted are ever returned.',
         'requests',
         requestsSchema,
+        READ_ANNOTATIONS,
+    );
+
+    tool(
+        'wicket_changes',
+        'Change history',
+        'What the agent created, changed or deleted through Wicket, and the actions and procedures it ran, ' +
+            'newest first: each entry with its fields\' old and new values as the field policy allows them ' +
+            '(shownAs clear, masked, or hidden without values). Your own changes; every user\'s only with the ' +
+            'Wicket - Audit Changes permission set. Follow @nextLink with cursor for more. 403 changes-off when ' +
+            'the history is off on the Wicket Setup card. Knock-on changes in other records are not listed: ' +
+            'BC\'s Change Log has those.',
+        'changes',
+        changesSchema,
         READ_ANNOTATIONS,
     );
 

@@ -15,7 +15,7 @@ Wicket fronts Microsoft Dynamics 365 Business Central: the wicket_* tools read, 
 - Filters: double-quote a field name unless it is plain [A-Za-z0-9_] ("No." eq '10000', "Posting Date" ge 2025-01-01); options by ordinal ("Document Type" eq 1); dates bare, strings in single quotes; no cross-field or (split it); contains() is case-sensitive.
 - Read only what you need: select the fields; aggregate for totals on stored fields (a FlowField such as Balance (LCY) is refused: sum the ledger instead); count:true to count; top for samples; wicket_query_all with maxRows from the count for exports, no orderBy.
 - Masked values (@masked, ****) are display text: never filter, sort, compute on or write them back.
-- Writes: one record per call; modify/delete with the row's @etag and an idempotencyKey; read it back; post via wicket_action, preview: true first; never edit a document's fields around a refused action.
+- Writes: modify/delete with the row's @etag + idempotencyKey; many records → one wicket_batch; post via wicket_action; preview: true first; read back; never edit a document's fields around a refused action.
 - Beyond a dozen rows present outside the chat: a file for Excel, an artifact page or dashboard, a doc for a shared report, wicket_page_url (card pageId) for a record a person acts on.
 - Small independent reads in parallel; heavy ones (1000-row discover, cold describe) one at a time. On an error read detail and suggest; retry a timed-out read once.
 - Installed apps may do more: before saying Wicket cannot, or when the map has no solution notes, offer to explore them (read-only, on a yes).
@@ -75,7 +75,7 @@ Details, inputs and result shapes for every tool: [tools](references/tools.md).
 
 ## Writing safely
 
-Read the row first; send `etag` on `modify`/`delete` and a fresh `idempotencyKey` on every write; send only the fields that change; never echo a masked rendering; verify by reading back; one record per call, a few in parallel for a batch, stop on the first unexpected failure. Posting commits at once and is never rolled back by Wicket: run the same call with `preview: true` first (it returns the entries, or why it would fail, and never posts), and never post twice. Full rules, replay semantics and the posting checklist: [writes](references/writes.md).
+Read the row first; send `etag` on `modify`/`delete` and a fresh `idempotencyKey` on every write; send only the fields that change; never echo a masked rendering; verify by reading back. A change to several records goes in one `wicket_batch` (all or nothing, `preview: true` first, items can reference earlier items). Posting commits at once and is never rolled back by Wicket: run the same call with `preview: true` first (it returns the entries, or why it would fail, and never posts), and never post twice. Full rules, replay semantics and the posting checklist: [writes](references/writes.md).
 
 ## Presenting
 
