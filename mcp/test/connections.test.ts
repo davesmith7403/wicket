@@ -4,7 +4,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cacheDir } from '../src/apiCatalog.ts';
 import {
@@ -13,6 +14,7 @@ import {
     ConnectionUnavailableError,
     DEFAULT_PUBLIC_CLIENT_ID,
     authRecordPath,
+    readAuthRecord,
     configHome,
     envSetting,
     keychain,
@@ -1071,5 +1073,36 @@ describe('config locations', () => {
         expect(keychain.store).toBeFunction();
         expect(keychain.remove).toBeFunction();
         expect(keychain.kind()).toBe(process.platform === 'win32' ? 'dpapi' : process.platform === 'darwin' ? 'keychain' : 'none');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// the saved account record
+// ---------------------------------------------------------------------------
+
+describe('readAuthRecord', () => {
+    const TENANT = '9B1C3D2E-0000-4000-8000-123456789ABC';
+    const CLIENT = '11111111-2222-4333-8444-555555555555';
+    const parse = (text: string) => JSON.parse(text) as { tenantId: string; clientId: string };
+    let dir: string;
+    let recordFile: string;
+    beforeEach(() => {
+        dir = mkdtempSync(join(tmpdir(), 'wicket-record-'));
+        recordFile = join(dir, 'me.json');
+        // The record always holds the tenant's GUID, as the sign-in returned it.
+        writeFileSync(recordFile, JSON.stringify({ tenantId: TENANT.toLowerCase(), clientId: CLIENT }));
+    });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    test('a tenant written in another letter case, or by domain, still finds its record', () => {
+        expect(readAuthRecord(recordFile, { tenantId: TENANT, clientId: CLIENT.toUpperCase() }, parse)).toBeDefined();
+        expect(readAuthRecord(recordFile, { tenantId: 'contoso.onmicrosoft.com', clientId: CLIENT }, parse)).toBeDefined();
+    });
+
+    test('another tenant GUID or another client discards the record', () => {
+        const other = '00000000-0000-4000-8000-000000000001';
+        expect(readAuthRecord(recordFile, { tenantId: other, clientId: CLIENT }, parse)).toBeUndefined();
+        expect(readAuthRecord(recordFile, { tenantId: TENANT, clientId: other }, parse)).toBeUndefined();
+        expect(readAuthRecord(recordFile, { tenantId: 'contoso.onmicrosoft.com', clientId: other }, parse)).toBeUndefined();
     });
 });

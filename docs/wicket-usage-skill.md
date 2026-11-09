@@ -291,7 +291,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `invalid-aggregate` | Aggregate combined with a row-plane key, an unknown key, or `sum`/`avg` on a FlowField or non-numeric field | Aggregate with `filter` only; sum the stored field of the table the FlowField is computed from (`references/tables.md`) |
 | `invalid-orderby` | Mixed directions, or fields that match no key | One direction; a key from `describe`, or no `orderBy` and client-side sort |
 | `batch-too-large` | A `batch` with more than `capabilities.limits.maxBatchItems` (100) items | Split it into several batches |
-| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, or a field that does not exist | Reference only earlier items that wrote a record; take the field name from `describe` |
+| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, a field that does not exist, or a FlowFilter, Blob or Media field | Reference only earlier items that wrote a record; take the field name from `describe` |
 | `invalid-cursor` | A cursor from another table, query shape or connection | Pass `@nextLink` back unchanged with the same query, or restart |
 | `record-table-mismatch` | A `recordId` from another table | Re-query the right table |
 | `not-binary` | `readBlob` on a non-binary field | A `BLOB`/`Media` field from `describe` |
@@ -366,6 +366,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 |---|---|---|
 | `validation` | A field failed `OnValidate` (`suggest.field`) | Fix the value and retry |
 | `insert-failed` / `modify-failed` / `delete-failed` | BC raised during the write; nothing of it persisted | Fix the cause and send the corrected request under a **new** key: the 422 is stored under the old one and replays |
+| `batch-failed` | A `wicket_batch` preview stopped on an error that named no item | Read `detail`, fix the batch and preview again; nothing was written |
 | `invoke-failed` | The enrolled wrapper raised | Fix args or state; new key |
 | `action-failed` | The posting or action raised — the document may be partly processed (released, numbers assigned, partly shipped) | Re-read the document before anything else; fix it; a **new** key |
 
@@ -408,7 +409,7 @@ A change that spans more than one record goes in **one `wicket_batch`**, not a s
 
 1. **Read first**, as for one write: resolve every row (one query with an `in (...)` filter, or a filtered `wicket_query_all`) so each modify and delete carries its `@recordId` and `@etag`.
 2. **Build the items** in order: `{ op: "insert"|"modify"|"delete", tableId, recordId?, values?, etag?, validate?, init? }`, the same rules as the single-write tools. Up to 100 items (`capabilities.limits.maxBatchItems`); split larger changes into several batches and say so.
-3. **Link items instead of guessing keys.** A value `{ "fromItem": n, "field": "No." }` (or `"fieldNo"`) is that field of the record item n wrote, read after it ran: create an order header, then its lines with `"Document No.": { "fromItem": 0, "field": "No." }`. `recordId: { "fromItem": n }` targets the record item n created or changed. Only earlier items; the field must be readable in clear (a hidden or masked field is refused).
+3. **Link items instead of guessing keys.** A value `{ "fromItem": n, "field": "No." }` (or `"fieldNo"`) is that field of the record item n wrote, read after it ran: create an order header, then its lines with `"Document No.": { "fromItem": 0, "field": "No." }`. `recordId: { "fromItem": n }` targets the record item n created or changed. Only earlier items; the field must be readable in clear on a table exposed for read (a hidden or masked field, or a write-only table, is refused); a FlowFilter, Blob or Media field cannot be referenced. A chained item needs no `etag`, also where the tenant requires one.
 4. **Preview first**: the same call with `preview: true` runs every item and rolls everything back. It answers each item's result, or the first failure, and writes nothing; show the user what would change. Then send it without `preview`.
 5. **On a failure nothing was written.** The problem names the item (`item`, `itemOp`, and `detail` starting `items[i] (op, table n)`): fix that item and resend the **whole** batch with a new key.
 6. **Verify and report**: the answer lists each item's `recordId` and new `@etag`; read the rows back and report what changed.
@@ -431,6 +432,7 @@ After a mutating verb:
 - **Posting commits immediately** and is outside any Wicket rollback. Treat it as the last write of the request.
 - **A failed post can leave committed changes** (the document released, numbers assigned, an order partly shipped). Re-read the document before retrying.
 - **`postCommitWarning` + `postCommitEvidence`** mean the posting succeeded but later code failed: the document **is** posted — surface the warning, never post again.
+- **Posting follows the page's rules.** `post-sales` and `post-purchase` refuse what the Post action refuses: a document an enabled approval workflow has not approved, unpaid prepayments, and any quote or blanket order (convert it first). A preview reports the same refusal. Send `systemId` alone, or with a `documentType` and `no` that name the same document.
 - **Release and reopen** (`release-sales`, `reopen-sales`, `release-purchase`, `reopen-purchase`) are what the document page's Release and Reopen actions do: approval and prepayment rules apply (a document pending approval is refused). Use them instead of editing `Status`. Result: `{ released | reopened: true, sourceDocumentType, sourceNo, status, changed }` — `changed: false` means it already had that status.
 - **Quote conversion** (`make-order-from-quote`, `make-invoice-from-quote`, `make-purchase-order-from-quote`) is the quote page's Make Order / Make Invoice: it checks the customer or vendor, copies the lines and **deletes the quote** — say so before running it. Result: `{ converted: true, sourceNo, quoteDeleted, createdDocumentType, createdNo, createdSystemId }`; continue with `createdSystemId`. A sales quote tied to an opportunity in progress is refused (`422`): the opportunity has to be closed in Business Central first.
 - **Answers Business Central computes** need no pre-flight: `item-availability` `{ itemNo, locationCode?, variantCode?, date?, quantity? }` returns `inventory`, `grossRequirement`, `scheduledReceipt`, `availableToPromise` (and with `quantity`, `earliestAvailableDate`, null when not within the look-ahead) — use it instead of summing ledger entries to promise a delivery. It and `document-pdf` are `mutating: false`: they run inside a forced rollback, need no key and work on a read-only endpoint.

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,8 +102,31 @@ func newFixture(t *testing.T, sumOverride string) *fixture {
 	return f
 }
 
+// deadPid and livePid stand for another start's process id: ended, and still running.
+const (
+	deadPid = 999999001
+	livePid = 999999002
+)
+
+func init() {
+	ownerAlive = func(pid int) bool { return pid == livePid }
+}
+
+// partial is the download a start that has ended (killed mid-download) left behind.
 func (f *fixture) partial() string {
-	return filepath.Join(f.root, "server", "bin", ".download-2.5.0-"+f.platform+".partial")
+	return f.partialOf(deadPid)
+}
+
+func (f *fixture) partialOf(pid int) string {
+	return filepath.Join(f.root, "server", "bin", fmt.Sprintf(".download-2.5.0-%s.%d-1.partial", f.platform, pid))
+}
+
+func age(t *testing.T, path string, by time.Duration) {
+	t.Helper()
+	then := time.Now().Add(-by)
+	if err := os.Chtimes(path, then, then); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *fixture) ensure() (string, error) {
@@ -201,15 +225,124 @@ func TestEnsureServerDropsACorruptPartialAndRecovers(t *testing.T) {
 
 func TestEnsureServerSweepsLeftoversOfEarlierStarts(t *testing.T) {
 	f := newFixture(t, "")
-	for _, debris := range []string{".download-123456", ".unpack-654321"} {
-		writeFile(t, filepath.Join(f.root, "server", "bin", debris, "junk"), "x")
+	bin := filepath.Join(f.root, "server", "bin")
+	// Left by starts that have ended, and by names without an owner that are older than any start lives.
+	ended := []string{
+		fmt.Sprintf(".unpack-%d-654321", deadPid),
+		fmt.Sprintf(".download-2.4.0-%s.%d-1.partial", f.platform, deadPid),
+		".download-123456",
+		".unpack-654321",
 	}
+	for _, debris := range ended {
+		writeFile(t, filepath.Join(bin, debris, "junk"), "x")
+	}
+	age(t, filepath.Join(bin, ".download-123456"), 2*staleAfter)
+	age(t, filepath.Join(bin, ".unpack-654321"), 2*staleAfter)
 	if _, err := f.ensure(); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := os.ReadDir(filepath.Join(f.root, "server", "bin"))
+	entries, _ := os.ReadDir(bin)
 	if len(entries) != 1 || entries[0].Name() != "2.5.0" {
 		t.Fatalf("bin holds %v", entries)
+	}
+}
+
+func TestEnsureServerLeavesARunningStartsFilesAlone(t *testing.T) {
+	// A reconnect during a slow first download: the first start is still writing its own files.
+	f := newFixture(t, "")
+	bin := filepath.Join(f.root, "server", "bin")
+	theirPartial := f.partialOf(livePid)
+	theirUnpack := filepath.Join(bin, fmt.Sprintf(".unpack-%d-42", livePid), "junk")
+	half := string(f.zip[:len(f.zip)/2])
+	writeFile(t, theirPartial, half)
+	writeFile(t, theirUnpack, "x")
+	if _, err := f.ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.ranges) != 0 {
+		t.Fatalf("this start resumed a running start's download: %v", f.ranges)
+	}
+	if got, err := os.ReadFile(theirPartial); err != nil || string(got) != half {
+		t.Fatalf("the running start's download was touched: %v", err)
+	}
+	if _, err := os.Stat(theirUnpack); err != nil {
+		t.Fatalf("the running start's unpack folder was removed: %v", err)
+	}
+	// Once it is older than any start lives, it goes whatever its owner's id says.
+	age(t, theirPartial, 2*staleAfter)
+	age(t, filepath.Dir(theirUnpack), 2*staleAfter)
+	os.RemoveAll(filepath.Join(bin, "2.5.0"))
+	if _, err := f.ensure(); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(bin)
+	if len(entries) != 1 || entries[0].Name() != "2.5.0" {
+		t.Fatalf("bin holds %v", entries)
+	}
+}
+
+func TestEnsureServerTwoStartsAtOnceBothSucceed(t *testing.T) {
+	f := newFixture(t, "")
+	// A slow line: each download stops halfway until both starts are downloading.
+	var inFlight sync.WaitGroup
+	inFlight.Add(2)
+	f.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.hits.Add(1)
+		w.Header().Set("Content-Length", fmt.Sprint(len(f.zip)))
+		w.Write(f.zip[:len(f.zip)/2])
+		w.(http.Flusher).Flush()
+		inFlight.Done()
+		inFlight.Wait()
+		w.Write(f.zip[len(f.zip)/2:])
+	})
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			path, err := f.ensure()
+			if err == nil {
+				_, err = os.Stat(path)
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("a start failed while another was downloading: %v", err)
+		}
+	}
+	entries, _ := os.ReadDir(filepath.Join(f.root, "server", "bin"))
+	if f.hits.Load() != 2 || len(entries) != 1 || entries[0].Name() != "2.5.0" {
+		t.Fatalf("downloads %d, bin holds %v", f.hits.Load(), entries)
+	}
+}
+
+func TestPlaceKeepsAnIdenticalServerThatIsAlreadyThere(t *testing.T) {
+	// The other start finished first; on Windows its running server cannot be replaced at all.
+	dir := t.TempDir()
+	work, final := filepath.Join(dir, ".unpack-1-1"), filepath.Join(dir, "2.5.0")
+	writeFile(t, filepath.Join(work, serverFileName()), "server")
+	writeFile(t, filepath.Join(final, serverFileName()), "server")
+	writeFile(t, filepath.Join(final, "marker"), "theirs")
+	if err := place(work, final); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(final, "marker")); err != nil {
+		t.Fatalf("the copy already in place was replaced: %v", err)
+	}
+}
+
+func TestPlaceReplacesAServerThatDiffers(t *testing.T) {
+	dir := t.TempDir()
+	work, final := filepath.Join(dir, ".unpack-1-1"), filepath.Join(dir, "2.5.0")
+	writeFile(t, filepath.Join(work, serverFileName()), "server")
+	writeFile(t, filepath.Join(final, serverFileName()), "damaged")
+	if err := place(work, final); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(final, serverFileName()))
+	entries, _ := os.ReadDir(dir)
+	if string(got) != "server" || len(entries) != 1 {
+		t.Fatalf("server %q, folder holds %v", got, entries)
 	}
 }
 

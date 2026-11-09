@@ -5,11 +5,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { configPath, type ConnectionRegistry } from '../src/connections.ts';
 import { MAP_MAX_BYTES, parseSections } from '../src/schemaKnowledge.ts';
 import {
+    COMPANY_A,
     COMPANY_B,
     FetchStub,
     TempDir,
@@ -315,6 +316,54 @@ describe('wicket_map', () => {
         expect(toolJsonAs<{ detail: string }>(big).detail).toContain('cap');
         const out = toolJsonAs<MapRead>(await call('wicket_map', { action: 'read' }));
         expect(out.sections).toEqual(['Small']);
+    });
+
+    test('a connection name re-pointed at another tenant, environment or company is not served the old map', async () => {
+        await call('wicket_map', { action: 'upsert', section: 'Tenant A notes', content: 'a' });
+        const metaFile = join(configPath('maps'), 'prod.meta.json');
+        expect(JSON.parse(readFileSync(metaFile, 'utf8')).target).toEqual({ tenantId: 'tenant-prod', environment: 'sandbox', companyId: COMPANY_A });
+
+        // "prod" removed and added again for another tenant.
+        await harness.close();
+        registry = loadRegistry(tmp, { default: 'prod', connections: { prod: entry({ tenantId: 'tenant-other' }) } });
+        harness = await startServer(registry);
+        const out = toolJsonAs<MapRead & { movedAside?: string[]; notice?: string }>(await call('wicket_map', { action: 'read' }));
+        expect(out.content).toBe('');
+        expect(out.sections).toEqual([]);
+        expect(out.notice).toContain('moved aside');
+        expect(out.movedAside).toHaveLength(2);
+        const asideMd = out.movedAside!.find((p) => /prod\.md\.replaced-\d{8}-\d{6}$/.test(p))!;
+        expect(readFileSync(asideMd, 'utf8')).toContain('## Tenant A notes');
+        expect(existsSync(join(configPath('maps'), 'prod.md'))).toBe(false);
+
+        // The new tenant's map starts empty and is stamped for it; reading it again moves nothing.
+        await call('wicket_map', { action: 'upsert', section: 'Tenant B notes', content: 'b' });
+        const again = toolJsonAs<MapRead & { movedAside?: string[] }>(await call('wicket_map', { action: 'read' }));
+        expect(again.sections).toEqual(['Tenant B notes']);
+        expect(again.movedAside).toBeUndefined();
+        expect(JSON.parse(readFileSync(metaFile, 'utf8')).target.tenantId).toBe('tenant-other');
+    });
+
+    test('an upsert onto a map written for another company moves that map aside first', async () => {
+        await call('wicket_map', { action: 'upsert', section: 'Company A notes', content: 'a' });
+        await harness.close();
+        registry = loadRegistry(tmp, { default: 'prod', connections: { prod: entry({ tenantId: 'tenant-prod', companyId: COMPANY_B }) } });
+        harness = await startServer(registry);
+        const res = toolJsonAs<{ created: boolean; movedAside?: string[] }>(await call('wicket_map', { action: 'upsert', section: 'Company B notes', content: 'b' }));
+        expect(res.created).toBe(true);
+        expect(res.movedAside).toHaveLength(2);
+        expect(readFileSync(join(configPath('maps'), 'prod.md'), 'utf8')).not.toContain('Company A notes');
+    });
+
+    test('a map from before the stamp existed is kept and stamped for the connection as it is now', async () => {
+        await call('wicket_map', { action: 'upsert', section: 'Old notes', content: 'o' });
+        const metaFile = join(configPath('maps'), 'prod.meta.json');
+        const { target: _target, ...legacy } = JSON.parse(readFileSync(metaFile, 'utf8'));
+        writeFileSync(metaFile, JSON.stringify(legacy));
+        const out = toolJsonAs<MapRead & { movedAside?: string[] }>(await call('wicket_map', { action: 'read' }));
+        expect(out.sections).toEqual(['Old notes']);
+        expect(out.movedAside).toBeUndefined();
+        expect(JSON.parse(readFileSync(metaFile, 'utf8')).target.tenantId).toBe('tenant-prod');
     });
 
     test('maps are per connection', async () => {

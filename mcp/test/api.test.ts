@@ -242,6 +242,7 @@ describe('wicket_api_read', () => {
         // A field the plan did not select never reaches the agent, even if BC sends it.
         expect(out.value).toEqual([{ '@odata.etag': 'W/1', id: 'g1', number: 'C1', displayName: 'Acme', balance: 5 }]);
         expect(stderr.lines.join('')).toContain('api read connection=prod route=v2.0/customers');
+        expect(stderr.lines.join('')).toContain('filterLength=0');
         // Governance was asked fresh, for this page.
         const describeCall = stub.rpcRequests.find((r) => opOf(r) === 'describe')!;
         expect(dataOf(describeCall)).toEqual({ kind: 'api', pageId: 30009 });
@@ -249,17 +250,26 @@ describe('wicket_api_read', () => {
 
     test('passes select, filter, orderBy, top, skip and count through, and reports @nextSkip on a full page', async () => {
         apiAnswer = () => jsonResponse({ '@odata.count': 7, value: [{ number: 'C1' }, { number: 'C2' }] });
-        const out = toolJsonAs<{ '@count': number; '@nextSkip': number }>(
-            await call('wicket_api_read', {
-                pageId: 30009,
-                select: ['number', 'displayName'],
-                filter: "balance gt 1000 and displayName eq 'O''Brien email'",
-                orderBy: ['displayName DESC'],
-                top: 2,
-                skip: 4,
-                count: true,
-            }),
-        );
+        const stderr = captureStderr();
+        let out: { '@count': number; '@nextSkip': number };
+        try {
+            out = toolJsonAs(
+                await call('wicket_api_read', {
+                    pageId: 30009,
+                    select: ['number', 'displayName'],
+                    filter: "balance gt 1000 and displayName eq 'O''Brien email'",
+                    orderBy: ['displayName DESC'],
+                    top: 2,
+                    skip: 4,
+                    count: true,
+                }),
+            );
+        } finally {
+            stderr.restore();
+        }
+        // The log line says how long the filter is, never what it holds (customer values).
+        expect(stderr.lines.join('')).toContain('filterLength=51');
+        expect(stderr.lines.join('')).not.toContain('Brien');
         const params = new URL(stub.matching(API_URL)[0]!.url).searchParams;
         expect(params.get('$select')).toBe('number,displayName');
         expect(params.get('$filter')).toBe("balance gt 1000 and displayName eq 'O''Brien email'");

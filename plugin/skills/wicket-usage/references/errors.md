@@ -15,7 +15,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `invalid-aggregate` | Aggregate combined with a row-plane key, an unknown key, or `sum`/`avg` on a FlowField or non-numeric field | Aggregate with `filter` only; sum the stored field of the table the FlowField is computed from (`references/tables.md`) |
 | `invalid-orderby` | Mixed directions, or fields that match no key | One direction; a key from `describe`, or no `orderBy` and client-side sort |
 | `batch-too-large` | A `batch` with more than `capabilities.limits.maxBatchItems` (100) items | Split it into several batches |
-| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, or a field that does not exist | Reference only earlier items that wrote a record; take the field name from `describe` |
+| `invalid-reference` | A batch `{ fromItem }` that names a later item, a deleted record, a field that does not exist, or a FlowFilter, Blob or Media field | Reference only earlier items that wrote a record; take the field name from `describe` |
 | `invalid-cursor` | A cursor from another table, query shape or connection | Pass `@nextLink` back unchanged with the same query, or restart |
 | `record-table-mismatch` | A `recordId` from another table | Re-query the right table |
 | `not-binary` | `readBlob` on a non-binary field | A `BLOB`/`Media` field from `describe` |
@@ -90,6 +90,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 |---|---|---|
 | `validation` | A field failed `OnValidate` (`suggest.field`) | Fix the value and retry |
 | `insert-failed` / `modify-failed` / `delete-failed` | BC raised during the write; nothing of it persisted | Fix the cause and send the corrected request under a **new** key: the 422 is stored under the old one and replays |
+| `batch-failed` | A `wicket_batch` preview stopped on an error that named no item | Read `detail`, fix the batch and preview again; nothing was written |
 | `invoke-failed` | The enrolled wrapper raised | Fix args or state; new key |
 | `action-failed` | The posting or action raised — the document may be partly processed (released, numbers assigned, partly shipped) | Re-read the document before anything else; fix it; a **new** key |
 

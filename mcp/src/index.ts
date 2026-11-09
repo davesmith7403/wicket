@@ -66,6 +66,7 @@ import {
     removeSection,
     summarizeDescribe,
     upsertSection,
+    type MapTarget,
 } from './schemaKnowledge.js';
 import { findSkillSection, instructionsFrom, loadSkillDoc, renderSkillToc } from './skill.js';
 import { openInBrowser, startSecretPage, type SecretPage } from './secretPage.js';
@@ -89,7 +90,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.6.0';
+export const SERVER_VERSION = '2.6.1';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -279,6 +280,10 @@ export class WicketClient {
             },
             operation,
             () => this.syntheticTimeoutProblem(operation, writes, idempotencyKey),
+            // A write whose connection broke (socket closed, reset, DNS, a body that never arrived) may
+            // have committed: the agent must get the same outcome guidance, and the key in use, as on
+            // a timeout. A read keeps the raw error.
+            writes ? (err) => this.syntheticNetworkProblem(operation, err, idempotencyKey) : undefined,
         );
 
         // The bound action always returns 200 with a JSON body. A non-200 here
@@ -324,13 +329,15 @@ export class WicketClient {
      * One authorized request: mint (or reuse) the token, send, and on a 401 drop the cached token and
      * resend ONCE — the gateway rejected the request before anything ran, so the resend is safe. A
      * device_code connection that still needs the human surfaces as a sign-in problem, a timeout as the
-     * caller's synthetic timeout problem.
+     * caller's synthetic timeout problem. Sending and reading the body fail alike: with `networkProblem`
+     * (writes) any other network failure becomes that problem; without it the raw error propagates.
      */
     private async authorizedFetch(
         url: string,
         init: { method: string; headers?: Record<string, string>; body?: string },
         operation: string,
         timeoutProblem: () => Rfc7807Problem,
+        networkProblem?: (err: unknown) => Rfc7807Problem,
     ): Promise<{ res: Response; text: string }> {
         let res: Response | undefined;
         let text = '';
@@ -352,13 +359,15 @@ export class WicketClient {
                     ...(init.body !== undefined ? { body: init.body } : {}),
                     signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
                 });
+                // Inside the try: the answer can also break off, or time out, while its body arrives.
+                text = await res.text();
             } catch (err) {
                 // Surface a timed-out gateway as a synthetic problem (matching the non-200
                 // transport path), not a raw DOMException.
                 if (isTimeoutError(err)) throw new WicketProblemError(timeoutProblem());
+                if (networkProblem) throw new WicketProblemError(networkProblem(err));
                 throw err;
             }
-            text = await res.text();
             // 401 = the gateway refused the token before the handler ran. Drop the cached token
             // and resend once — a revoked/rotated token must not fail every call until expiry.
             if (res.status === 401 && attempt === 0 && this.tokens.invalidate) {
@@ -378,6 +387,16 @@ export class WicketClient {
 
     get connectionName(): string {
         return this.spec.name;
+    }
+
+    /** What this connection points at; stamped on its tenant map, which is filed by connection name only. */
+    get mapTarget(): MapTarget {
+        return {
+            tenantId: this.spec.tenantId,
+            environment: this.spec.environment,
+            companyId: this.companyId,
+            ...(this.spec.baseUrl ? { baseUrl: this.baseUrl } : {}),
+        };
     }
 
     /**
@@ -526,6 +545,20 @@ export class WicketClient {
             detail:
                 `BC did not respond within ${RPC_TIMEOUT_MS / 1000}s on connection ` +
                 `"${this.spec.name}". The gateway may be down or the operation too slow. ${hint}`,
+            operation,
+        };
+    }
+
+    /** A write whose request or answer was lost on the network: the outcome is unknown, like a timeout. */
+    private syntheticNetworkProblem(operation: string, err: unknown, idempotencyKey: string | undefined): Rfc7807Problem {
+        const reason = truncate(err instanceof Error ? err.message : String(err), 300);
+        return {
+            type: `${PROBLEM_BASE}transport`,
+            title: 'Transport error (connection lost)',
+            status: 502,
+            detail:
+                `The connection to BC broke on connection "${this.spec.name}" before a complete answer ` +
+                `arrived (${reason}). ${retryGuidance(true, idempotencyKey)}`,
             operation,
         };
     }
@@ -1763,7 +1796,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                 );
                 process.stderr.write(
                     `[wicket-mcp] api read connection=${client.connectionName} route=${api.route} ` +
-                        `select=${plan.select.length} fields filter=${plan.filter ?? ''} rows=${rows.length}\n`,
+                        `select=${plan.select.length} fields filterLength=${plan.filter?.length ?? 0} rows=${rows.length}\n`,
                 );
                 return ok({
                     '@via': 'api',
@@ -1831,7 +1864,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         // The map is local: an unreachable endpoint must not hide it. Staleness is then unknown.
                         warning = `structureVersion unavailable: ${err instanceof Error ? err.message : String(err)}`;
                     }
-                    const result = readMap(name, current);
+                    const result = readMap(name, current, client.mapTarget);
                     return ok({
                         ...result,
                         ...(warning ? { warning } : {}),
@@ -1841,11 +1874,11 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                     });
                 }
                 if (section === undefined) throw new TenantMapError(`action "${action}" needs a section`);
-                if (action === 'remove') return ok({ connection: name, removed: section.trim(), ...removeSection(name, section) });
+                if (action === 'remove') return ok({ connection: name, removed: section.trim(), ...removeSection(name, section, client.mapTarget) });
                 if (content === undefined) throw new TenantMapError('upsert needs content');
                 const current = await currentStructureVersion(client);
-                const { created, bytes } = upsertSection(name, section, content, current);
-                return ok({ connection: name, section: section.trim(), created, bytes, structureVersionAtWrite: current });
+                const { created, bytes, ...moved } = upsertSection(name, section, content, current, client.mapTarget);
+                return ok({ connection: name, section: section.trim(), created, bytes, structureVersionAtWrite: current, ...moved });
             } catch (err) {
                 if (err instanceof TenantMapError) {
                     return fail(
@@ -2239,7 +2272,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                                 ? { keychainService: target!.keychainService, keychainAccount: target!.keychainAccount }
                                 : {}),
                         };
-                        upsertConnection(name, fields, {
+                        const { droppedBaseUrl } = upsertConnection(name, fields, {
                             replace: args.replace ?? false,
                             makeDefault: args.makeDefault ?? false,
                             // A label for listings that does not depend on reaching BC; never over a user's own.
@@ -2260,20 +2293,46 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                         registry.reload();
                         const rejected = registry.rejected.find((r) => r.name === name);
                         if (rejected) throw new Error(`Saved, but the connection does not load: ${rejected.message}`);
-                        return ok({ saved: name, health: await healthOf(registry.resolve(name)) });
+                        return ok({
+                            saved: name,
+                            ...(droppedBaseUrl !== undefined
+                                ? {
+                                      baseUrlDropped: droppedBaseUrl,
+                                      note: 'The tenant or environment changed, so the base URL this connection had was removed: calls now go to the standard address for the new tenant and environment. Tell the user; a connection that needs its own base URL gets it back by hand in connections.json.',
+                                  }
+                                : {}),
+                            health: await healthOf(registry.resolve(name)),
+                        });
                     }
                     case 'remove': {
                         const name = need(args.name, 'name');
                         refuseEnv(name);
                         const spec = registry.list().some((c) => c.name === name) ? registry.resolve(name) : undefined;
+                        // Another connection may read the same stored secret (same service and account).
+                        const sharedWith = spec?.keychainAccount
+                            ? registry
+                                  .list()
+                                  .filter((c) => c.name !== name)
+                                  .filter((c) => {
+                                      const other = registry.resolve(c.name);
+                                      return other.keychainService === spec.keychainService && other.keychainAccount === spec.keychainAccount;
+                                  })
+                                  .map((c) => c.name)
+                            : [];
                         const { defaultCleared } = removeConnection(name);
                         // Only the secret setup itself filed (service "wicket"); a vault entry the user named stays.
-                        if (spec?.keychainService === 'wicket' && spec.keychainAccount) {
-                            await keychain.remove(spec.keychainService, spec.keychainAccount).catch(() => undefined);
+                        const ownsSecret = spec?.keychainService === 'wicket' && Boolean(spec.keychainAccount);
+                        if (ownsSecret && sharedWith.length === 0) {
+                            await keychain.remove(spec!.keychainService!, spec!.keychainAccount!).catch(() => undefined);
                         }
                         registry.reload();
                         return ok({
                             removed: name,
+                            ...(ownsSecret && sharedWith.length > 0
+                                ? {
+                                      secretKept: `The stored secret ${spec!.keychainService}/${spec!.keychainAccount} was kept: connection ${sharedWith.map((n) => `"${n}"`).join(', ')} also uses it.`,
+                                  }
+                                : {}),
                             ...(defaultCleared ? { defaultCleared: true, next: 'Ask which connection becomes the default (setDefault).' } : {}),
                             connections: registry.list(),
                             current: registry.current(),

@@ -206,9 +206,62 @@ function compactObject(obj: Record<string, unknown>): Record<string, unknown> {
 export const MAP_MAX_BYTES = 128 * 1024;
 export const MAP_SECTION_MAX_LENGTH = 200;
 
+/** What a map describes: the tenant, environment and company its connection pointed at when it was written. */
+export interface MapTarget {
+    tenantId: string;
+    environment: string;
+    companyId: string;
+    /** Set for a connection with its own base URL (on-premises), where it names the environment. */
+    baseUrl?: string;
+}
+
 interface MapMeta {
     structureVersionAtWrite?: string;
     updatedAt?: string;
+    target?: MapTarget;
+}
+
+const TARGET_KEYS = ['tenantId', 'environment', 'companyId', 'baseUrl'] as const;
+
+function sameTarget(a: MapTarget, b: MapTarget): boolean {
+    return TARGET_KEYS.every((k) => (a[k] ?? '').toLowerCase() === (b[k] ?? '').toLowerCase());
+}
+
+/**
+ * Tie the map file to what its connection points at. The file is named by the connection alone, so
+ * a connection removed and added again under the same name for another tenant, environment or
+ * company would be served the old one's notes. A map stamped for another target is moved aside
+ * (never deleted) and its new paths returned; a map from before the stamp existed is taken to belong
+ * to the current target and stamped.
+ */
+export function claimMap(connection: string, target: MapTarget | undefined): string[] | undefined {
+    if (!target) return undefined;
+    const { md, meta } = mapPaths(connection);
+    if (!existsSync(md) && !existsSync(meta)) return undefined;
+    const m = readMeta(meta);
+    if (m.target === undefined) {
+        writeJson(meta, { ...m, target }, 'tenant map metadata');
+        return undefined;
+    }
+    if (sameTarget(m.target, target)) return undefined;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    const moved: string[] = [];
+    for (const path of [md, meta]) {
+        if (!existsSync(path)) continue;
+        let aside = `${path}.replaced-${stamp}`;
+        for (let n = 2; existsSync(aside); n++) aside = `${path}.replaced-${stamp}-${n}`;
+        try {
+            renameSync(path, aside);
+        } catch (err) {
+            // Never serve, or write into, another target's notes because they could not be set aside.
+            throw new TenantMapError(
+                `the map of connection "${connection}" was written for another tenant, environment or company and could not be moved aside: ` +
+                    (err instanceof Error ? err.message : String(err)),
+            );
+        }
+        moved.push(aside);
+    }
+    return moved;
 }
 
 export class TenantMapError extends Error {}
@@ -222,7 +275,14 @@ export interface MapReadResult {
     currentStructureVersion: string | null;
     /** true when the apps changed since the map was last written; null when either version is unknown. */
     stale: boolean | null;
+    /** Set when a map written for another tenant, environment or company was moved aside: where it went. */
+    movedAside?: string[];
+    notice?: string;
 }
+
+const MOVED_ASIDE_NOTICE =
+    'This connection name used to point at another tenant, environment or company: the map written for that one ' +
+    'was moved aside (movedAside) and is not served. This map starts empty.';
 
 /** maps/<connection>.md under the wicket config dir; connection names are [A-Za-z0-9._-]. */
 export function mapPaths(connection: string): { md: string; meta: string } {
@@ -238,7 +298,8 @@ export async function currentStructureVersion(client: KnowledgeClient): Promise<
     return typeof v === 'string' && v !== '' ? v : null;
 }
 
-export function readMap(connection: string, current: string | null): MapReadResult {
+export function readMap(connection: string, current: string | null, target?: MapTarget): MapReadResult {
+    const movedAside = claimMap(connection, target);
     const { md, meta } = mapPaths(connection);
     const content = existsSync(md) ? readFileSync(md, 'utf8') : '';
     const m = readMeta(meta);
@@ -251,12 +312,20 @@ export function readMap(connection: string, current: string | null): MapReadResu
         structureVersionAtWrite: atWrite,
         currentStructureVersion: current,
         stale: atWrite !== null && current !== null ? atWrite !== current : null,
+        ...(movedAside ? { movedAside, notice: MOVED_ASIDE_NOTICE } : {}),
     };
 }
 
 /** Replace the named section's body, or append it; returns whether it existed. */
-export function upsertSection(connection: string, section: string, body: string, current: string | null): { created: boolean; bytes: number } {
+export function upsertSection(
+    connection: string,
+    section: string,
+    body: string,
+    current: string | null,
+    target?: MapTarget,
+): { created: boolean; bytes: number; movedAside?: string[]; notice?: string } {
     const name = validateSection(section);
+    const movedAside = claimMap(connection, target);
     const { md, meta } = mapPaths(connection);
     const content = existsSync(md) ? readFileSync(md, 'utf8') : '';
     const { preamble, sections } = splitSections(content);
@@ -275,13 +344,24 @@ export function upsertSection(connection: string, section: string, body: string,
         );
     }
     writeText(md, next);
-    writeJson(meta, { structureVersionAtWrite: current ?? undefined, updatedAt: new Date().toISOString() } satisfies MapMeta, 'tenant map metadata', true);
-    return { created: !existing, bytes };
+    writeJson(
+        meta,
+        { structureVersionAtWrite: current ?? undefined, updatedAt: new Date().toISOString(), ...(target ? { target } : {}) } satisfies MapMeta,
+        'tenant map metadata',
+        true,
+    );
+    return { created: !existing, bytes, ...(movedAside ? { movedAside, notice: MOVED_ASIDE_NOTICE } : {}) };
 }
 
-export function removeSection(connection: string, section: string): { bytes: number } {
+export function removeSection(connection: string, section: string, target?: MapTarget): { bytes: number } {
     const name = validateSection(section);
+    const movedAside = claimMap(connection, target);
     const { md, meta } = mapPaths(connection);
+    if (movedAside) {
+        throw new TenantMapError(
+            `${MOVED_ASIDE_NOTICE} Nothing was removed (moved to: ${movedAside.join(', ')}).`,
+        );
+    }
     const content = existsSync(md) ? readFileSync(md, 'utf8') : '';
     const { preamble, sections } = splitSections(content);
     const index = sections.findIndex((s) => s.name === name);

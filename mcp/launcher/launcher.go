@@ -22,11 +22,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultReleases = "https://github.com/davesmith7403/wicket/releases/download/"
+
+// staleAfter is the age past which a leftover in bin/ belongs to no running start, whatever its
+// name says: a start gives up its download after ten minutes (the HTTP client's limit in main).
+const staleAfter = time.Hour
+
+// ownerAlive tells whether the start that owns a leftover still runs (a variable for the tests).
+var ownerAlive = processAlive
 
 // maxDownload caps a release download; a wrong mirror must not fill the disk before the checksum says no.
 var maxDownload int64 = 512 << 20
@@ -119,18 +127,23 @@ func ensureServer(root, platform, base string, client *http.Client, logw io.Writ
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", err
 	}
-	partial := filepath.Join(binDir, ".download-"+version+"-"+platform+".partial")
-	sweep(binDir, filepath.Base(partial))
+	// Every start works on files of its own, named with its process id: two starts at once (a
+	// reconnect during a slow first download) must not write to one file or clear each other's work.
+	own := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	prefix := ".download-" + version + "-" + platform + "."
+	partial := filepath.Join(binDir, prefix+own+".partial")
+	// A download that a start no longer running left behind is taken over and resumed: Claude Code
+	// gives a server 30 seconds, so on a slow line the first start may be killed mid-download.
+	sweep(binDir, prefix, partial)
 
-	// The zip is fetched into a fixed partial file that a later start resumes: Claude Code gives a
-	// server 30 seconds, so on a slow line the first start may be killed mid-download.
 	url := downloadURL(base, version, zipName)
 	fmt.Fprintf(logw, "wicket: first start of %s: downloading the Wicket server for %s\n", version, platform)
 	if err := download(client, url, partial, want); err != nil {
 		return "", err
 	}
+	defer os.Remove(partial)
 	// Unpacked beside its final place and renamed in, so nothing half-written ever looks complete.
-	work, err := os.MkdirTemp(binDir, ".unpack-")
+	work, err := os.MkdirTemp(binDir, fmt.Sprintf(".unpack-%d-", os.Getpid()))
 	if err != nil {
 		return "", err
 	}
@@ -138,33 +151,118 @@ func ensureServer(root, platform, base string, client *http.Client, logw io.Writ
 	if err := unzipServer(partial, work); err != nil {
 		return "", err
 	}
-	final := filepath.Dir(target)
-	if _, err := os.Stat(target); err == nil {
-		os.Remove(partial)
-		return target, nil // another start finished first; its copy is as good as ours
-	}
-	// A version folder without its server (quarantined, deleted) would block the rename for good.
-	os.RemoveAll(final)
-	if err := renameWithRetry(work, final); err != nil {
-		if _, statErr := os.Stat(target); statErr == nil {
-			os.Remove(partial)
-			return target, nil
-		}
+	if err := place(work, filepath.Dir(target)); err != nil {
 		return "", err
 	}
-	os.Remove(partial)
 	fmt.Fprintf(logw, "wicket: server %s ready\n", version)
 	return target, nil
 }
 
-// sweep removes what earlier starts left in bin/ (unpack folders, other partial downloads).
-func sweep(binDir, keep string) {
+// place moves the unpacked folder work to final with one rename. When final is already there, a
+// server in it identical to ours means another start finished first (on Windows nothing can
+// replace it either, while it runs): that copy is used. Anything else in the way (a version folder
+// whose server was quarantined or deleted, a damaged copy) is set aside and replaced.
+func place(work, final string) error {
+	name := serverFileName()
+	same := func() bool { return sameFile(filepath.Join(work, name), filepath.Join(final, name)) }
+	if os.Rename(work, final) == nil || same() {
+		return nil
+	}
+	if _, err := os.Stat(final); err == nil {
+		// Set aside by rename, never emptied in place: a start that looks at this folder sees a
+		// whole copy or none.
+		aside := work + "-replaced"
+		if err := os.Rename(final, aside); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cannot replace %s: %w", final, err)
+		}
+		defer os.RemoveAll(aside)
+	}
+	if err := renameWithRetry(work, final); err != nil {
+		if same() {
+			return nil // another start put its copy there in between
+		}
+		return err
+	}
+	return nil
+}
+
+// sameFile tells whether both files exist and hold the same bytes.
+func sameFile(a, b string) bool {
+	sumA, errA := fileSum(a)
+	sumB, errB := fileSum(b)
+	return errA == nil && errB == nil && sumA == sumB
+}
+
+func fileSum(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// ownerOf reads the process id out of a leftover's name: ".download-<version>-<platform>.<pid>-<n>.partial"
+// or ".unpack-<pid>-<random>". ok is false for a name without one.
+func ownerOf(name string) (pid int, ok bool) {
+	var field string
+	switch {
+	case strings.HasPrefix(name, ".unpack-"):
+		field, _, _ = strings.Cut(strings.TrimPrefix(name, ".unpack-"), "-")
+	case strings.HasPrefix(name, ".download-") && strings.HasSuffix(name, ".partial"):
+		last := strings.TrimSuffix(name, ".partial")
+		last = last[strings.LastIndex(last, ".")+1:]
+		owner, serial, found := strings.Cut(last, "-")
+		if _, err := strconv.ParseInt(serial, 10, 64); !found || err != nil {
+			return 0, false
+		}
+		field = owner
+	default:
+		return 0, false
+	}
+	pid, err := strconv.Atoi(field)
+	return pid, err == nil && pid > 0
+}
+
+// sweep clears what ended starts left in bin/ and leaves alone what a running start is working on.
+// A leftover is abandoned when the start that owns it (the process id in its name) has ended, or
+// when it is older than any start lives; a name without an owner counts by age alone. An abandoned
+// download of this version and platform (prefix) is not thrown away: the largest becomes partial,
+// by rename, so of two starts taking over at once only one gets it and the other starts afresh.
+func sweep(binDir, prefix, partial string) {
 	entries, _ := os.ReadDir(binDir)
+	var best string
+	var bestSize int64 = -1
 	for _, e := range entries {
 		name := e.Name()
-		if name != keep && (strings.HasPrefix(name, ".download-") || strings.HasPrefix(name, ".unpack-")) {
-			os.RemoveAll(filepath.Join(binDir, name))
+		if !strings.HasPrefix(name, ".download-") && !strings.HasPrefix(name, ".unpack-") {
+			continue
 		}
+		info, err := e.Info()
+		if err != nil {
+			continue // gone already: another start took it
+		}
+		old := time.Since(info.ModTime()) > staleAfter
+		pid, owned := ownerOf(name)
+		if !old && (!owned || pid == os.Getpid() || ownerAlive(pid)) {
+			continue
+		}
+		if !old && strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".partial") && info.Size() > bestSize {
+			if best != "" {
+				os.Remove(filepath.Join(binDir, best))
+			}
+			best, bestSize = name, info.Size()
+			continue
+		}
+		os.RemoveAll(filepath.Join(binDir, name))
+	}
+	if best != "" {
+		// On Windows the rename fails while a process still has the file open: then it is not ours to take.
+		_ = os.Rename(filepath.Join(binDir, best), partial)
 	}
 }
 
@@ -180,7 +278,7 @@ func renameWithRetry(from, to string) error {
 	return err
 }
 
-// download fetches url into path, resuming what an earlier start left there, and checks the whole
+// download fetches url into path, resuming what an earlier start left there (see sweep), and checks the whole
 // file's SHA-256 against want. A file that does not match is removed, so the next start begins afresh.
 func download(client *http.Client, url, path, want string) error {
 	var have int64

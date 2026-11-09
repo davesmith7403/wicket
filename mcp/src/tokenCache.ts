@@ -85,21 +85,34 @@ interface KeyStore {
     store(service: string, account: string, secret: string): Promise<void>;
 }
 
+/** `security` exits 44 (errSecItemNotFound) when the Keychain has no such item; execFile reports it as `code`. */
+const KEYCHAIN_ITEM_NOT_FOUND = 44;
+const KEY_RE = /^[0-9a-f]{64}$/i;
+
+function isNotFound(err: unknown): boolean {
+    return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === KEYCHAIN_ITEM_NOT_FOUND;
+}
+
 /**
  * The cache key from the store, created on first use. Read back after storing, so two servers
- * starting at once settle on the key that was written last.
+ * starting at once settle on the key that was written last. A key is created only when the store
+ * says there is none: any other failure of the lookup (a locked Keychain, a refused prompt, a
+ * timeout) is passed on, never answered by storing a new key over the one in use.
  */
 export function cacheKeySource(store: KeyStore): KeySource {
     let key: Promise<Buffer> | undefined;
     const fetch = async (): Promise<Buffer> => {
         try {
             const hex = await store.find(KEY_SERVICE, KEY_ACCOUNT);
-            if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, 'hex');
-        } catch {
-            /* not created yet */
+            if (KEY_RE.test(hex)) return Buffer.from(hex, 'hex');
+            // An item that is not a key was never one of ours to lose: it is replaced below.
+        } catch (err) {
+            if (!isNotFound(err)) throw err;
         }
         await store.store(KEY_SERVICE, KEY_ACCOUNT, randomBytes(32).toString('hex'));
-        return Buffer.from(await store.find(KEY_SERVICE, KEY_ACCOUNT), 'hex');
+        const stored = await store.find(KEY_SERVICE, KEY_ACCOUNT);
+        if (!KEY_RE.test(stored)) throw new Error('The token cache key read back from the Keychain is not a 256-bit key.');
+        return Buffer.from(stored, 'hex');
     };
     return {
         get() {

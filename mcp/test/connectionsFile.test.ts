@@ -116,6 +116,27 @@ describe('upsertConnection', () => {
     });
 });
 
+describe('upsertConnection and a hand-set baseUrl', () => {
+    const BASE = 'https://bc.old.example/BC';
+
+    test('a replace that changes the tenant or the environment drops the kept baseUrl and reports it', () => {
+        for (const change of [{ tenantId: 'tenant-b' }, { environment: 'Other' }]) {
+            seed({ connections: { prod: entry({ environment: 'Production', baseUrl: BASE }) } });
+            expect(upsertConnection('prod', change, { replace: true })).toEqual({ droppedBaseUrl: BASE });
+            expect(read().connections.prod).toMatchObject(change);
+            expect(read().connections.prod).not.toHaveProperty('baseUrl');
+        }
+    });
+
+    test('the baseUrl stays when tenant and environment are the same (whatever the case), or the call brings one', () => {
+        seed({ connections: { prod: entry({ environment: 'Production', baseUrl: BASE }) } });
+        expect(upsertConnection('prod', { tenantId: 'TENANT-A', environment: 'production', companyId: COMPANY_B }, { replace: true })).toEqual({});
+        expect(read().connections.prod!.baseUrl).toBe(BASE);
+        expect(upsertConnection('prod', { tenantId: 'tenant-b', baseUrl: 'https://bc.new.example/BC' }, { replace: true })).toEqual({});
+        expect(read().connections.prod!.baseUrl).toBe('https://bc.new.example/BC');
+    });
+});
+
 describe('moveAsideBroken / removeConnection / setDefaultConnection', () => {
     test('moveAsideBroken renames the file and returns the new path', () => {
         seed('{ not json');

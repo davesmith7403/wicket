@@ -193,6 +193,29 @@ describe('wicket_setup', () => {
         expect(JSON.parse(readFileSync(file, 'utf8')).connections.a).toMatchObject({ environment: 'Sandbox', companyId: COMPANY_B });
     });
 
+    test('save with replace onto another tenant drops the old base URL and says so', async () => {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(
+            file,
+            JSON.stringify({ connections: { a: entry({ keychainService: 'wicket', keychainAccount: 'a', secretEnv: undefined, baseUrl: 'https://bc.old.example/BC' }) } }),
+        );
+        routeAppToken();
+        stub.rpc(() => odata({}));
+        await start();
+        await setup({ action: 'signin', method: 'client_credentials', tenantId: TID, clientId: 'app-1', keychainService: 'wicket', keychainAccount: 'a' });
+        const res = await setup({ action: 'save', name: 'a', environment: 'Production', companyId: COMPANY_A, replace: true });
+        expect(toolIsError(res)).toBe(false);
+        expect(toolJsonAs<{ baseUrlDropped?: string; note?: string }>(res)).toMatchObject({
+            baseUrlDropped: 'https://bc.old.example/BC',
+            note: expect.stringContaining('base URL'),
+        });
+        const saved = JSON.parse(readFileSync(file, 'utf8')).connections.a;
+        expect(saved.tenantId).toBe(TID);
+        expect(saved).not.toHaveProperty('baseUrl');
+        // The health check of the saved connection already went to the standard address.
+        expect(stub.rpcRequests.at(-1)!.url).toContain(`api.businesscentral.dynamics.com/v2.0/${TID}/Production/`);
+    });
+
     test('an invalid entry is refused before anything is written', async () => {
         routeAppToken();
         await start();
@@ -427,6 +450,28 @@ describe('wicket_setup', () => {
             await start();
             for (const name of ['a', 'b']) expect(toolIsError(await setup({ action: 'remove', name }))).toBe(false);
             expect(removed).toEqual([['wicket', 'a']]);
+        } finally {
+            keychain.remove = realRemove;
+        }
+    });
+
+    test('removing a connection keeps a stored secret another connection still uses, and says so', async () => {
+        mkdirSync(join(file, '..'), { recursive: true });
+        const shared = { keychainService: 'wicket', keychainAccount: 'shared', secretEnv: undefined };
+        writeFileSync(file, JSON.stringify({ default: 'a', connections: { a: entry(shared), b: entry({ ...shared, companyId: COMPANY_B }) } }));
+        const removed: unknown[] = [];
+        const realRemove = keychain.remove;
+        keychain.remove = async (service, account) => void removed.push([service, account]);
+        try {
+            await start();
+            const first = toolJsonAs<{ removed: string; secretKept?: string }>(await setup({ action: 'remove', name: 'a' }));
+            expect(first.secretKept).toContain('wicket/shared');
+            expect(first.secretKept).toContain('"b"');
+            expect(removed).toEqual([]);
+            // The last connection using it takes the secret with it.
+            const last = toolJsonAs<{ removed: string; secretKept?: string }>(await setup({ action: 'remove', name: 'b' }));
+            expect(last.secretKept).toBeUndefined();
+            expect(removed).toEqual([['wicket', 'shared']]);
         } finally {
             keychain.remove = realRemove;
         }

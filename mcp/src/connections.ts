@@ -1019,7 +1019,7 @@ function enableTokenCachePersistence(useIdentityPlugin: (plugin: never) => void)
  * The saved account record for a connection, or undefined when absent, unreadable, or for a
  * different tenant/client (the connection was re-pointed — sign in afresh).
  */
-function readAuthRecord<R extends { tenantId: string; clientId: string }>(
+export function readAuthRecord<R extends { tenantId: string; clientId: string }>(
     file: string,
     spec: { tenantId: string; clientId: string },
     deserialize: (text: string) => R,
@@ -1027,7 +1027,11 @@ function readAuthRecord<R extends { tenantId: string; clientId: string }>(
     if (!existsSync(file)) return undefined;
     try {
         const record = deserialize(readFileSync(file, 'utf8'));
-        return record.tenantId === spec.tenantId && record.clientId === spec.clientId ? record : undefined;
+        // The record holds the tenant's GUID; a hand-written connection may name the tenant by domain
+        // ("contoso.onmicrosoft.com") or in another letter case. Only a GUID can be compared.
+        const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+        const tenantMatches = !GUID_RE.test(spec.tenantId) || same(record.tenantId, spec.tenantId);
+        return tenantMatches && same(record.clientId, spec.clientId) ? record : undefined;
     } catch {
         return undefined;
     }

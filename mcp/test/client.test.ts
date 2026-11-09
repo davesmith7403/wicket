@@ -329,6 +329,48 @@ describe('WicketClient transport failure guidance', () => {
         expect(read.problem.detail).toContain('safe to retry');
         expect(read.problem.detail).toContain('Narrow the query');
     });
+
+    test('a write whose connection breaks is a transport problem naming the key; a read keeps the raw error', async () => {
+        stub.token().rpc(() => {
+            throw new TypeError('The socket connection was closed unexpectedly');
+        });
+        const client = new WicketClient(spec({ name: 'flaky' }));
+        // The key may be the agent's own or the one the server minted for invoke/action/batch.
+        for (const [operation, key] of [['action', 'auto-0b0e9d0e-7a51-4c58-9d3b-0f6f3c1f2a10'], ['insert', 'k-7'], ['batch', 'b-1']] as const) {
+            const err = await problemOf(client.call(operation, { tableId: 18 }, key));
+            expect(err.problem).toMatchObject({ type: 'https://wicket.example/errors/transport', status: 502, operation });
+            expect(err.problem.detail).toContain('connection "flaky"');
+            expect(err.problem.detail).toContain('socket connection was closed');
+            expect(err.problem.detail).toContain('outcome is UNKNOWN');
+            expect(err.problem.detail).toContain(`SAME idempotencyKey ("${key}")`);
+        }
+        const unkeyed = await problemOf(client.call('delete', { tableId: 18 }));
+        expect(unkeyed.problem.detail).toContain('Do NOT blindly retry');
+        await expect(client.call('query', { tableId: 18 })).rejects.toThrow(TypeError);
+    });
+
+    test('a write whose answer breaks off while the body arrives gets the same guidance', async () => {
+        const broken = (error: Error) =>
+            new Response(
+                new ReadableStream({
+                    start(controller) {
+                        controller.error(error);
+                    },
+                }),
+                { status: 200 },
+            );
+        stub.token().rpc((_req, nth) =>
+            broken(nth === 0 ? new Error('ECONNRESET while reading the body') : new DOMException('The operation timed out.', 'TimeoutError')),
+        );
+        const client = new WicketClient(spec());
+        const reset = await problemOf(client.call('modify', { tableId: 18 }, 'k-9'));
+        expect(reset.problem).toMatchObject({ type: 'https://wicket.example/errors/transport', status: 502 });
+        expect(reset.problem.detail).toContain('SAME idempotencyKey ("k-9")');
+        // A body that times out is the timeout problem, as a request that times out is.
+        const timedOut = await problemOf(client.call('modify', { tableId: 18 }, 'k-9'));
+        expect(timedOut.problem).toMatchObject({ type: 'https://wicket.example/errors/transport-timeout', status: 504 });
+        expect(timedOut.problem.detail).toContain('SAME idempotencyKey ("k-9")');
+    });
 });
 
 describe('WicketClient 401 handling', () => {

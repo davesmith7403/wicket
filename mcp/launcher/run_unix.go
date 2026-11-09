@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os/signal"
 	"runtime"
 	"syscall"
@@ -32,4 +33,10 @@ func releaseSignals() {
 // runServer replaces this process with the server, so Claude Code talks to it directly.
 func runServer(path string, args, env []string) error {
 	return syscall.Exec(path, append([]string{path}, args...), env)
+}
+
+// processAlive tells whether a process with this id exists (one we may not signal still exists).
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }

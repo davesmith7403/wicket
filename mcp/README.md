@@ -5,8 +5,9 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that fronts
 MCP-capable agent (Claude Desktop, Claude Code, etc.) gets the Wicket
 operations as native tools.
 
-It speaks MCP over **stdio**, authenticates to Business Central with an OAuth2
-`client_credentials` service principal, and translates each tool call into a
+It speaks MCP over **stdio**, authenticates to Business Central either as an OAuth2
+`client_credentials` service principal or as a signed-in user (`device_code` or `browser`
+sign-in; see [Connections](#connections)), and translates each tool call into a
 Wicket bound-action POST, unwrapping the result (or surfacing the RFC 7807
 problem) for the agent.
 
@@ -47,8 +48,8 @@ per-call override that targets a named connection for that one call. See
 
 Every tool carries **MCP tool annotations** (`readOnlyHint`, `destructiveHint`,
 `idempotentHint`), so a host such as Claude Code can auto-approve the read tools and
-prompt before `wicket_insert` / `wicket_modify` / `wicket_delete` / `wicket_invoke` /
-`wicket_action` / `wicket_query_deliver`. `wicket_query_deliver` is the one open-world tool
+prompt before `wicket_insert` / `wicket_modify` / `wicket_delete` / `wicket_batch` /
+`wicket_invoke` / `wicket_action` / `wicket_query_deliver`. `wicket_query_deliver` is the one open-world tool
 (`openWorldHint: true`): it creates a request row and uploads a package with a shareable
 link to Azure Blob storage, which is why async delivery is a separate tool rather than an
 option on the read-only `wicket_query`. Annotations are hints; the enforcement is a
@@ -117,10 +118,12 @@ After editing the skill run `bun run skill:sync`: it refreshes `skill/` and writ
 `skill` operation. The suite fails when either is out of date, when a tool has no section, or when
 the essentials outgrow the instructions budget.
 
-**Claude Code plugin (recommended for Claude Code).** `plugin/` packages the server (bundled into
-one file by `bun run plugin:build`, so it needs Bun but no `bun install`), the skill, and two
-user-invoked skills: `/wicket:orient` (posture and map in one turn) and `/wicket:inventory` (build or
-refresh the tenant's capability inventory). The repository root is its marketplace:
+**Claude Code plugin (recommended for Claude Code).** `plugin/` packages a small launcher that
+downloads the self-contained server for the machine on its first start (nothing to install, no Bun;
+see [Install](#install)), the usage skill, and three user-invoked skills: `/wicket:setup` (add, view
+or fix a connection from the chat), `/wicket:orient` (posture and map in one turn) and
+`/wicket:inventory` (build or refresh the tenant's capability inventory). Its marketplace is the
+public plugin repository:
 
 ```
 /plugin marketplace add davesmith7403/wicket
@@ -213,12 +216,15 @@ server posture. Call it to verify **which connection/tenant you are actually on*
 
 ### Idempotency (`idempotencyKey`)
 
-The state-changing tools — `wicket_insert`, `wicket_modify`, `wicket_delete`,
+The state-changing tools — `wicket_insert`, `wicket_modify`, `wicket_delete`, `wicket_batch`,
 `wicket_invoke`, `wicket_action` and `wicket_query_deliver` — accept an optional
 `idempotencyKey` (a caller-supplied string, ≤ 128 printable chars) that is stamped on the
 envelope. (For `wicket_query_deliver` a resubmit with the same key replays to the **same**
-`requestId` instead of spawning a duplicate export.) The server never
-auto-generates one; it is sent only when you provide it. Retrying with the **same
+`requestId` instead of spawning a duplicate export.) For `wicket_invoke`, `wicket_action` and
+`wicket_batch` the server mints a key (`auto-<uuid>`) when the call carries none and returns it
+in the result as `@idempotencyKey` (with `@idempotencyKeyGenerated: true`), so a call whose answer
+was lost can be retried with that key. For the other tools a key is sent only when you provide
+it. Retrying with the **same
 key + same `{operation, data}`** replays the stored result (the response carries
 `"@replayed": true`); the **same key with a different body** returns a
 `409 idempotency-conflict` problem. A key executes at most once: a resend while the
@@ -377,7 +383,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.6.0+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.6.1+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -387,7 +393,8 @@ shows up in the Wicket Operation Log. The implicit env `default` connection hono
 
 For the state-changing tools, when the caller supplies an `idempotencyKey` the server
 adds it to the envelope alongside `data` (`{ ..., "data": { ... },
-"idempotencyKey": "<key>" }`); it is omitted otherwise.
+"idempotencyKey": "<key>" }`). Without one, `invoke`, `action` and `batch` calls carry a
+server-minted `auto-<uuid>` key; for the other tools the member is omitted.
 
 The bound action **always returns HTTP 200**. The result arrives as a JSON string
 in `value`; the server parses it and then inspects that object:
@@ -411,7 +418,7 @@ The MCP server also generates a few problems of its own, same shape:
 | `transport` · HTTP status | BC answered non-200 (gateway / auth / routing). A `5xx` `detail` adds the retry guidance above. |
 | `transport-timeout` · 504 | No response within 120 s. `detail` carries the retry guidance. |
 | `connection-read-only` · 403 | A mutating tool on a `readOnly` connection (nothing sent). |
-| `sign-in-required` · 401 | A `device_code` connection is waiting for the user to sign in; `detail`, `verificationUri` and `userCode` carry the URL + code. |
+| `sign-in-required` · 401 | A `device_code` or `browser` connection is waiting for the user to sign in. For device code, `detail`, `verificationUri` and `userCode` carry the URL + code; for browser sign-in a window has opened. |
 | `use-deliver-tool` · 400 | `wicket_query` called with `deliver` (nothing sent). |
 - Otherwise `value` is the result. For `query`, the OData annotations
   `@nextLink` / `@count` / `@pagingMode` are preserved alongside it; an
@@ -715,13 +722,15 @@ Applications entry in BC with a Wicket role set assigned to the client ID.)
 ### Read-only connections
 
 Set `"readOnly": true` on a connection (or `BC_READ_ONLY=1` for the env `default`) and
-the server refuses `insert`, `modify`, `delete`, `invoke` and `action` for it **before a
+the server refuses `insert`, `modify`, `delete`, `batch`, `invoke` and `action` for it **before a
 token is even minted**, answering a `403 connection-read-only` problem that names the
 connection and points the agent at `wicket_connections` to pick a writable one. Reads,
-`status`/`cancel`/`requests`, `pageUrl` and `whoAmI` are unaffected.
+`status`/`cancel`/`requests`, `changes`, `pageUrl` and `whoAmI` are unaffected, and so are the
+calls that run inside the server's forced rollback: a `batch` or `action` with `preview: true`,
+and an action enrolled as non-mutating.
 
 **`wicket_query_deliver` is allowed on a read-only connection.** The guard mirrors Wicket's
-own mutating list (AL `IsMutating`: insert/modify/delete/invoke/action), and Wicket treats
+own mutating list (AL `IsMutating`: insert/modify/delete/batch/invoke/action), and Wicket treats
 an async delivery as a read — the worker re-runs the query under your identity and its
 own read-only mode does not refuse it. Delivery still creates a request row and a
 shareable blob package, so if a connection must not export data at all, restrict it on
@@ -843,12 +852,13 @@ appear in the tool list.
 
 1. `wicket_discover` `{ "kind": "tables", "filter": "*Customer*" }` — confirm table 18 is reachable.
 2. `wicket_describe` `{ "kind": "table", "tableId": 18 }` — learn fields, keys, permissions, `hasSystemFields`.
-3. `wicket_query` `{ "tableId": 18, "select": ["No.","Name","Balance (LCY)"], "filter": "\"Country/Region Code\" eq 'US' and Blocked eq ' '", "orderBy": ["Name asc"], "top": 5, "include": { "flowFields": true } }` — note: field names with spaces/`/` must be quoted, `Blocked eq ' '` is the blank (not-blocked) state, and `orderBy` must be an indexed field (not a FlowField).
+3. `wicket_query` `{ "tableId": 18, "select": ["No.","Name","Balance (LCY)"], "filter": "\"Country/Region Code\" eq 'US' and Blocked eq 0", "orderBy": ["Name asc"], "top": 5, "include": { "flowFields": true } }` — note: field names with spaces/`/` must be quoted, an Option field is filtered by ordinal (`Blocked eq 0` is the blank, not-blocked member; take ordinals from `wicket_describe`, because member names depend on the session language), and `orderBy` must be an indexed field (not a FlowField).
 4. `wicket_read_blob` `{ "tableId": 18, "recordId": "<@recordId from step 3>", "fieldNo": <the binary field's `no` from step 2> }` — fetch the picture (take the exact `fieldNo` from `describe`, don't guess).
 
 ## Notes & limits
 
-- One record per `insert` / `modify` / `delete` (no bulk). Pass an
+- `insert` / `modify` / `delete` take one record per call; `wicket_batch` writes up to 100
+  items (any mix of the three, any tables) in one call and one transaction. Pass an
   `idempotencyKey` to make a retry safe (replays with `"@replayed": true`).
 - `invoke` is deny-by-default: only procedures enrolled in the Wicket Procedure
   Catalog are callable; discover them with `wicket_describe` `kind: "codeunit"`.

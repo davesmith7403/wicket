@@ -227,6 +227,19 @@ describe('operation tools', () => {
         expect(envelopeOf(stub.rpcRequests[1]!).idempotencyKey as string).toMatch(/^auto-/);
     });
 
+    test('a lost connection on an action without a key reports the minted key to resend with', async () => {
+        stub.rpc(() => {
+            throw new TypeError('The socket connection was closed unexpectedly');
+        });
+        const res = await call('wicket_action', { action: 'post-sales', target: { systemId: 'abc' } });
+        expect(res.isError).toBe(true);
+        const key = envelopeOf(stub.rpcRequests[0]!).idempotencyKey as string;
+        expect(key).toMatch(/^auto-[0-9a-f-]{36}$/);
+        const text = JSON.stringify(res.content);
+        expect(text).toContain('outcome is UNKNOWN');
+        expect(text).toContain(key);
+    });
+
     test('a caller key is used verbatim and nothing is minted for insert/modify/delete', async () => {
         stub.rpc(() => odata({ ok: true }));
         const res = await call('wicket_action', { action: 'post-sales', idempotencyKey: 'post-42' });

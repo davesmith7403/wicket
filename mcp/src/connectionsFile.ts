@@ -62,7 +62,11 @@ function edit(change: (doc: FileDoc) => void): void {
     writeDoc(file, doc);
 }
 
-/** Add `name`, or merge `fields` over it when `replace` is set; other keys of the entry are kept. */
+/**
+ * Add `name`, or merge `fields` over it when `replace` is set; other keys of the entry are kept —
+ * except a `baseUrl` when the tenant or environment changes and `fields` brings no new one: it is
+ * removed and returned as `droppedBaseUrl`.
+ */
 export function upsertConnection(
     name: string,
     fields: Record<string, unknown>,
@@ -75,17 +79,27 @@ export function upsertConnection(
         drop?: readonly string[];
         validate?: (name: string, merged: Record<string, unknown>) => void;
     },
-): void {
+): { droppedBaseUrl?: string } {
+    let droppedBaseUrl: string | undefined;
     edit((doc) => {
         const existing = Object.hasOwn(doc.connections, name) ? doc.connections[name] : undefined;
         if (existing && !opts.replace) throw new Error(`connection "${name}" exists`);
         const merged: Record<string, unknown> = { ...(opts.defaults ?? {}), ...(existing ?? {}), ...fields };
         for (const key of opts.drop ?? []) delete merged[key];
+        // A kept baseUrl names the old tenant/environment: re-pointing the entry without a new one
+        // would keep sending calls there.
+        const moved = (key: string) =>
+            key in fields && String(fields[key] ?? '').toLowerCase() !== String(existing?.[key] ?? '').toLowerCase();
+        if (existing && typeof existing.baseUrl === 'string' && !('baseUrl' in fields) && (moved('tenantId') || moved('environment'))) {
+            droppedBaseUrl = existing.baseUrl;
+            delete merged.baseUrl;
+        }
         // Check the entry as it will be written, kept fields included (a companies allowlist, say).
         opts.validate?.(name, merged);
         doc.connections[name] = merged;
         if (opts.makeDefault) doc.default = name;
     });
+    return droppedBaseUrl !== undefined ? { droppedBaseUrl } : {};
 }
 
 /**

@@ -7,7 +7,7 @@ Before any caller can hit `/api/wicket/rpc/v1.0/...`, BC SaaS needs to know who'
 
 Without step 2 the token validates but every call returns `401 / "User does not exist"`.
 
-This doc covers the service-to-service (S2S) flow, which is what LLM agents and backend services typically use. Delegated-user OAuth works too but requires the user to sign in interactively; not covered here.
+This doc covers the service-to-service (S2S) flow, which is what backend services and unattended agents use. Delegated sign-in (a person signing in by browser or device code, as the MCP server's guided setup does) needs no Microsoft Entra Applications entry; the Product Guide and `mcp/README.md` cover it.
 
 ---
 
@@ -25,7 +25,7 @@ This doc covers the service-to-service (S2S) flow, which is what LLM agents and 
 
 3. **API permissions → Add a permission → APIs my organization uses → "Dynamics 365 Business Central".**
    - For S2S: **Application permissions → `app_access`**. Check it.
-   - (For delegated user flows you'd add `Financials.ReadWrite.All` under Delegated permissions instead.)
+   - (For delegated user flows add **Delegated permissions → `user_impersonation`** instead, and allow public client flows. The MCP server requests the `.default` scope, which resolves to the delegated permissions the app has been consented for.)
    - **Grant admin consent for <tenant>.** Without admin consent the token will lack the right scope.
 
 4. Note these three values — you'll need them every time:
@@ -45,7 +45,7 @@ In your BC SaaS environment:
 4. **Description:** anything meaningful — `Wicket service principal` works.
 5. **State:** `Enabled`.
 6. **User Permission Sets** subform — assign at least:
-   - One Wicket **role** for the endpoint itself: `Wicket - Read` (read operations only), `Wicket - Execute` (adds `invoke`/`action`) or `Wicket - Edit` (adds `insert`/`modify`/`delete`). Pick the lowest rung the agent needs — Wicket's role gate refuses the operations above that rung with a typed `403 role-forbidden` problem (naming the permission set required) before any handler runs. (`Bcmag Rpc`, the pre-2026-09 name, still works as an alias of `Wicket - Edit`.)
+   - One Wicket **role** for the endpoint itself: `Wicket - Read` (read operations only), `Wicket - Execute` (adds `invoke`/`action`) or `Wicket - Edit` (adds `insert`/`modify`/`delete`/`batch`). Pick the lowest rung the agent needs — Wicket's role gate refuses the operations above that rung with a typed `403 role-forbidden` problem (naming the permission set required) before any handler runs.
    - A permission set covering the **data** the app actually queries. `Wicket Data - Read` grants Read on every table plus table/page/query Execute in one assignment ("read any information"); `Wicket Data - Exec` adds Execute on every codeunit/report/xmlport while keeping direct table data read-only. For sandbox testing, `D365 BUS PREMIUM` is also fine (`SUPER` cannot be assigned to an application). For a production write-capable agent, build a tight custom set that grants only the specific tabledata RIMD bits the use case needs.
 7. Save.
 
@@ -56,10 +56,10 @@ Without that user-permission-set assignment, the app principal exists but has ze
 The Wicket role sets (`Wicket - Read` / `Wicket - Execute` / `Wicket - Edit`) only grant access to Wicket's own tables, the API page and the operation handlers of that rung — they are the price of admission, not authority over your business data. `Wicket - Admin` is for the human who configures Wicket and `Wicket - Audit` for someone who must see the logs, the queue and the policy pages without changing them.
 
 - **Read** (`query`, `readBlob`, `describe`, `discover`) needs the app principal to hold **read** permission on the target tables, and those tables to be exposed for read in **Wicket Exposure** (or `Mode = Open` in **Wicket Setup**).
-- **Write** (`insert`, `modify`, `delete`) additionally needs the app principal to hold **write** (Insert/Modify/Delete) permission on the target tables, and the per-row `Allow Insert` / `Allow Modify` / `Allow Delete` flags set in **Wicket Exposure**. Both gates are independent: a missing tabledata write bit returns `422`, a missing exposure flag returns `403`.
+- **Write** (`insert`, `modify`, `delete`, and `batch`, which carries many of them in one transaction) additionally needs the app principal to hold **write** (Insert/Modify/Delete) permission on the target tables, and the per-row `Allow Insert` / `Allow Modify` / `Allow Delete` flags set in **Wicket Exposure**. Both gates are independent: a missing tabledata write bit returns `422`, a missing exposure flag returns `403`.
 - **Invoke** (`invoke`) is deny-by-default on two gates of its own: the codeunit must be exposed for invoke (`Allow Invoke` in **Wicket Exposure**), **and** the `{codeunitId, procedure}` pair must be enrolled in the **Wicket Procedure Catalog** with `Allow Run = true`. Open mode does not bypass invoke unless `Allow Invoke In Open Mode` is set in **Wicket Setup**. The app principal must also hold whatever permissions the wrapper codeunit's own logic exercises.
 
-So for a write/invoke-capable agent, assign the app principal `Wicket - Edit` (or `Wicket - Execute` for invoke/action without the generic write plane) together with a permission set that includes the write (and, for invoke, the underlying business) permissions, then enrol the tables/procedures in Wicket Exposure and (for invoke) the Procedure Catalog. A principal holding only `Wicket - Read` is refused `insert`/`modify`/`delete`/`invoke`/`action` no matter what else it holds — the dispatcher checks the rung's role-gate table before the handler runs and answers a `403 role-forbidden` problem whose detail names the permission set required. This holds even for `Wicket Data - Exec`, whose codeunit wildcard reaches the write handlers: the Write Gate is granted only by `Wicket - Edit`.
+So for a write/invoke-capable agent, assign the app principal `Wicket - Edit` (or `Wicket - Execute` for invoke/action without the generic write plane) together with a permission set that includes the write (and, for invoke, the underlying business) permissions, then enrol the tables/procedures in Wicket Exposure and (for invoke) the Procedure Catalog. A principal holding only `Wicket - Read` is refused `insert`/`modify`/`delete`/`batch`/`invoke`/`action` no matter what else it holds — the dispatcher checks the rung's role-gate table before the handler runs and answers a `403 role-forbidden` problem whose detail names the permission set required. This holds even for `Wicket Data - Exec`, whose codeunit wildcard reaches the write handlers: the Write Gate is granted only by `Wicket - Edit`.
 
 Two **Wicket Setup** write-plane policies also apply, whatever the role: on a fresh install *Require Key For Actions* is on, so an `invoke` or `action` call without an envelope `idempotencyKey` is refused with `400 idempotency-key-required`, and *Allow Trigger Bypass* is off, so `insert` with `init: false` or `modify` with `validate: false` is refused with `403 trigger-bypass-disabled`. A tenant upgraded from an earlier build keeps the old behaviour (keys optional, bypass allowed) until an administrator changes the switches.
 

@@ -81,7 +81,8 @@ describe('cacheKeySource', () => {
         const keychain = {
             find: async (s: string, a: string) => {
                 const v = store.get(`${s}/${a}`);
-                if (v === undefined) throw new Error('not found');
+                // `security` exits 44 when the item does not exist; execFile reports it as `code`.
+                if (v === undefined) throw Object.assign(new Error('The specified item could not be found in the keychain.'), { code: 44 });
                 return v;
             },
             store: async (s: string, a: string, secret: string) => void store.set(`${s}/${a}`, secret),
@@ -90,6 +91,34 @@ describe('cacheKeySource', () => {
         expect(first).toHaveLength(32);
         expect(store.get('wicket/token-cache-key')).toBe(first.toString('hex'));
         expect((await cacheKeySource(keychain).get()).equals(first)).toBe(true);
+    });
+
+    test('a lookup that fails for another reason than "no such item" never replaces the key', async () => {
+        const stored: string[] = [];
+        const failing = (err: Error) => ({
+            find: async (): Promise<string> => {
+                throw err;
+            },
+            store: async (_s: string, _a: string, secret: string) => void stored.push(secret),
+        });
+        // A locked Keychain (exit 36 here), a refused prompt, a timeout (code is then a string or absent).
+        const locked = Object.assign(new Error('User interaction is not allowed.'), { code: 36 });
+        await expect(cacheKeySource(failing(locked)).get()).rejects.toThrow(/User interaction/);
+        await expect(cacheKeySource(failing(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }))).get()).rejects.toThrow(/timed out/);
+        await expect(cacheKeySource(failing(new Error('spawn security ENOENT'))).get()).rejects.toThrow(/ENOENT/);
+        expect(stored).toEqual([]);
+    });
+
+    test('a value read back after storing that is not a key is refused', async () => {
+        let created = false;
+        const keychain = {
+            find: async (): Promise<string> => {
+                if (!created) throw Object.assign(new Error('not found'), { code: 44 });
+                return 'not-a-key';
+            },
+            store: async () => void (created = true),
+        };
+        await expect(cacheKeySource(keychain).get()).rejects.toThrow(/not a 256-bit key/);
     });
 });
 
