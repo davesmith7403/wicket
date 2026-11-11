@@ -102,11 +102,11 @@ Parallel reads in one turn; subagents for fan-out that would flood the context; 
 
 # Tool reference
 
-The 24 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
+The 26 `wicket_*` MCP tools, in workflow order. Every tool that reaches Business Central (BC) accepts `connection: "<name>"` to target one configured connection for that call. A failed call returns an RFC 7807 problem as the tool error: read `detail` (the fix in words) and `suggest` (a machine hint such as the closest field name) before retrying. Recovery per error slug: `references/errors.md`.
 
 ## wicket_connections
 
-Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials`, `device_code` or `browser`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`invoke`/`action` before anything is sent. When nothing usable is configured, the answer also carries `problem` (`missing`, `invalid` or `dangling-default`), and an entry set aside for a bad value is listed under `rejected` with its reason: offer `/wicket:setup`.
+Lists the configured connections: `name`, `tenantId`, `environment`, `companyId`, `authMode` (`client_credentials`, `device_code` or `browser`), `readOnly`, `unmask` (only when the connection sets it), `isDefault`, `isSelected`. Local, free. Call it once when more than one connection may exist, then pass `connection` on every call rather than switching with `wicket_use`. A `readOnly` connection refuses `insert`/`modify`/`delete`/`batch`/`invoke`/`action` before anything is sent (a preview and a non-mutating action still run). When nothing usable is configured, the answer also carries `problem` (`missing`, `invalid` or `dangling-default`), and an entry set aside for a bad value is listed under `rejected` with its reason: offer `/wicket:setup`.
 
 ## wicket_whoami
 
@@ -198,7 +198,7 @@ A BC web-client deep link for one record: `table` (a name such as `"Customer"` o
 
 ## wicket_skill
 
-This guide, with progressive disclosure: `mode:"toc"` (default) lists every file and section; `mode:"section"` with a section title or a reference file name (`filters`, `errors`, `writes`, `presenting`, `automation`, `tables`, `protocol`, `tools`) returns that text; `mode:"full"` returns everything (large). Local and free.
+This guide, with progressive disclosure: `mode:"toc"` (default) lists every file and section; `mode:"section"` with a section title or a reference file name (`filters`, `errors`, `writes`, `presenting`, `automation`, `tables`, `solutions`, `protocol`, `tools`) returns that text; `mode:"full"` returns everything (large). Local and free.
 
 ## wicket_setup
 
@@ -315,7 +315,7 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `field-masked` | A masked field in `filter`, `orderBy`, `aggregate`, an effective key, the modified window or `readBlob` | Drop the masked field from that clause |
 | `read-only` | A write or a mutating `action` while the endpoint is read-only (an action preview and a `mutating: false` verb still run) | Reads and previews only until an administrator lifts it; check `capabilities.readOnly` |
 | `connection-read-only` (MCP) | A mutating tool on a connection marked `readOnly` in the MCP server; nothing was sent | Pass `connection` naming a writable one |
-| `role-forbidden` | The principal's Wicket role is below the operation (`Execute` for invoke/action, `Edit` for writes) | A human assigns the rung `detail` names |
+| `role-forbidden` | The principal's Wicket role is below the operation (`Execute` for invoke/action, `Edit` for writes), or it holds no caller set at all (every call, `whoAmI` included: `Wicket - Audit` and `Wicket - Audit Changes` open pages, they do not make a caller) | A human assigns the set `detail` names |
 | `trigger-bypass-disabled` | `init: false` / `validate: false` while the tenant forbids it | Omit the member |
 | `invoke-disabled` / `action-disabled` | Enrolled, but `Allow Run` is off | An administrator enables it; the same idempotency key can then be reused |
 | `async-not-configured` | `deliver` on a tenant without a usable async configuration | Read inline or page; an administrator completes the setup |
@@ -368,13 +368,13 @@ Every failure is an RFC 7807 problem `{ type, title, status, detail, instance, o
 | `insert-failed` / `modify-failed` / `delete-failed` | BC raised during the write; nothing of it persisted | Fix the cause and send the corrected request under a **new** key: the 422 is stored under the old one and replays |
 | `batch-failed` | A `wicket_batch` preview stopped on an error that named no item | Read `detail`, fix the batch and preview again; nothing was written |
 | `invoke-failed` | The enrolled wrapper raised | Fix args or state; new key |
-| `action-failed` | The posting or action raised — the document may be partly processed (released, numbers assigned, partly shipped) | Re-read the document before anything else; fix it; a **new** key |
+| `action-failed` | The posting or action raised — the document may be partly processed (released, numbers assigned, partly shipped) | Read `detail` first. If it says the current permissions prevented the action, the caller lacks a Business Central right (it names the object): stop and ask a human to assign it, the document is not at fault. Otherwise re-read the document before anything else; fix it; a **new** key |
 
 ## Server and transport (5xx, MCP synthetic)
 
 | Slug | Cause | Do |
 |---|---|---|
-| `internal` (500) | An unhandled AL error, or a commit failure in which nothing persisted | Reads: retry with backoff. A keyed `insert`/`modify`/`delete`: resend with the **same** key (a 5xx is not stored). A keyed `invoke`/`action`: the same key answers `idempotency-indeterminate` — verify the result first |
+| `internal` (500) | An unhandled AL error, or a commit failure in which nothing persisted | Reads: retry with backoff. A keyed `insert`/`modify`/`delete`: resend with the **same** key (a 5xx is not stored). A keyed `invoke`/`action`: the same key answers `idempotency-indeterminate` — verify the result first. When the key was minted for you, the problem carries it as `@idempotencyKey` |
 | `transport` (HTTP status, MCP) | BC's gateway answered non-200: 401/403 auth, 404 routing, 5xx outage; the handler never ran or its answer was lost | 4xx: fix per `detail` (a 401 was already retried once with a fresh token). 5xx on a write: resend with the same key, or query the records first when you sent none |
 | `transport-timeout` (504, MCP) | No answer within 120 s. The first heavy call to an idle sandbox (`capabilities`, a first `describe`) can take that long while the environment warms up, while `whoami` answers at once | Same as a 5xx: a read is retried once; for a slow query also narrow it. Several heavy metadata calls fired in parallel on a cold environment can all time out: retry them one at a time |
 | `sign-in-required` (401, MCP) | A `device_code` or `browser` connection needs the user to sign in | Device code: show `verificationUri` and `userCode`. Browser: say a sign-in window opened. Retry after they sign in |
@@ -432,15 +432,15 @@ After a mutating verb:
 - **Posting commits immediately** and is outside any Wicket rollback. Treat it as the last write of the request.
 - **A failed post can leave committed changes** (the document released, numbers assigned, an order partly shipped). Re-read the document before retrying.
 - **`postCommitWarning` + `postCommitEvidence`** mean the posting succeeded but later code failed: the document **is** posted — surface the warning, never post again.
-- **Posting follows the page's rules.** `post-sales` and `post-purchase` refuse what the Post action refuses: a document an enabled approval workflow has not approved, unpaid prepayments, and any quote or blanket order (convert it first). A preview reports the same refusal. Send `systemId` alone, or with a `documentType` and `no` that name the same document.
-- **Release and reopen** (`release-sales`, `reopen-sales`, `release-purchase`, `reopen-purchase`) are what the document page's Release and Reopen actions do: approval and prepayment rules apply (a document pending approval is refused). Use them instead of editing `Status`. Result: `{ released | reopened: true, sourceDocumentType, sourceNo, status, changed }` — `changed: false` means it already had that status.
+- **Posting follows the page's rules.** `post-sales` and `post-purchase` refuse what the Post action refuses: a document an enabled approval workflow has not approved, unpaid prepayments, any quote or blanket order (convert it first), a purchase invoice whose total differs from its incoming document's amount, and for an order what the signed-in user's own User Setup forbids (an invoice posting policy of Prohibited: send `invoice: false`; Mandatory: ship or receive and invoice together). A preview reports the same refusal. Send `systemId` alone, or with a `documentType` and `no` that name the same document.
+- **Release and reopen** (`release-sales`, `reopen-sales`, `release-purchase`, `reopen-purchase`) are what the document page's Release and Reopen actions do: approval and prepayment rules apply (a document pending approval is refused). Use them instead of editing `Status`. Result: `{ released | reopened, sourceDocumentType, sourceNo, status, changed }` — `released` is true only when the document ended as `Released` (read `status` otherwise); `changed: false` means it already had that status.
 - **Quote conversion** (`make-order-from-quote`, `make-invoice-from-quote`, `make-purchase-order-from-quote`) is the quote page's Make Order / Make Invoice: it checks the customer or vendor, copies the lines and **deletes the quote** — say so before running it. Result: `{ converted: true, sourceNo, quoteDeleted, createdDocumentType, createdNo, createdSystemId }`; continue with `createdSystemId`. A sales quote tied to an opportunity in progress is refused (`422`): the opportunity has to be closed in Business Central first.
 - **Answers Business Central computes** need no pre-flight: `item-availability` `{ itemNo, locationCode?, variantCode?, date?, quantity? }` returns `inventory`, `grossRequirement`, `scheduledReceipt`, `availableToPromise` (and with `quantity`, `earliestAvailableDate`, null when not within the look-ahead) — use it instead of summing ledger entries to promise a delivery. It and `document-pdf` are `mutating: false`: they run inside a forced rollback, need no key and work on a read-only endpoint.
 - Result shapes: `post-sales` `{ posted, sourceDocumentType, sourceNo, postedShipmentNo?, postedReturnReceiptNo?, postedInvoiceNo? }` (`postedInvoiceNo` is the credit memo number for a credit memo or return order); `post-purchase` the receipt/return-shipment/invoice equivalents; `post-gen-journal` / `post-item-journal` `{ posted, template, batch, glRegisterNo | itemRegisterNo, firstEntryNo, lastEntryNo }` or `noEntriesPosted: true`.
 
 ## Who may write
 
-`Wicket - Read` cannot write or run anything; `Wicket - Execute` adds `invoke`/`action`; `Wicket - Edit` adds `insert`/`modify`/`delete`. A call below the principal's rung is `403 role-forbidden` before anything runs — a human assigns the rung `detail` names; retrying cannot help. On top of the rung, the principal needs the normal BC permissions, and the table must be exposed for that operation unless the mode is `Open`. A connection marked `readOnly` in the MCP server refuses all five mutating tools client-side, and the endpoint's own read-only mode refuses them server-side (actions included, previews too).
+`Wicket - Read` cannot write or run anything; `Wicket - Execute` adds `invoke`/`action`; `Wicket - Edit` adds `insert`/`modify`/`delete`. A principal without `Wicket - Read` (or a set that includes it) cannot call anything. A call below the principal's rung is `403 role-forbidden` before anything runs — a human assigns the rung `detail` names; retrying cannot help. On top of the rung, the principal needs the normal BC permissions, and the table must be exposed for that operation unless the mode is `Open`. A connection marked `readOnly` in the MCP server refuses the six mutating tools (`insert`, `modify`, `delete`, `batch`, `invoke`, `action`) client-side, and the endpoint's own read-only mode refuses them server-side. A preview and a non-mutating action still run under both.
 
 # Presenting results
 

@@ -122,8 +122,9 @@ const ConnectionEntry = z.object({
     /** Required for client_credentials; the delegated modes default to DEFAULT_PUBLIC_CLIENT_ID. */
     clientId: z.string().min(1).optional(),
     /**
-     * device_code only: keep the sign-in across MCP restarts — MSAL's token cache in the OS
-     * keychain, the account record in ~/.config/wicket/auth/<name>.json. Default true; false
+     * Delegated modes: keep the sign-in across MCP restarts — MSAL's token cache (macOS: an encrypted
+     * file keyed from the Keychain, see tokenCache.ts; Windows: DPAPI), the account record in
+     * ~/.config/wicket/auth/<name>.json. Default true; false
      * keeps the token in memory only (sign in again on every start).
      */
     persistTokenCache: z.boolean().default(true),
@@ -136,8 +137,8 @@ const ConnectionEntry = z.object({
     keychainAccount: z.string().optional(),
     baseUrl: z.string().refine(isHttpsUrl, BASE_URL_MSG).optional(),
     /**
-     * Client-side write guard. When true the MCP server refuses insert/modify/delete/invoke/
-     * action for this connection BEFORE any token is fetched, answering a synthetic 403
+     * Client-side write guard. When true the MCP server refuses insert/modify/delete/batch/invoke/
+     * action (not a preview or a non-mutating action) for this connection BEFORE any token is fetched, answering a synthetic 403
      * connection-read-only problem that names the connection and points at wicket_connections.
      * Defense in depth over Wicket's server-side Read-Only Mode: one MCP process can front a
      * read-only production and a writable sandbox side by side, and the guard holds even if the
@@ -184,8 +185,10 @@ const ConnectionsFile = z.object({
 }).strict();
 
 const CONNECTION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
-/** Object-prototype keys: as a key of the connections object they would read or set the prototype. */
-const RESERVED_NAMES: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+/** Object-prototype keys (as a key of the connections object they would read or set the prototype), and: */
+// token-cache-key: the Keychain account that holds the token cache's key (tokenCache.ts); a connection
+// of that name would store its client secret over it.
+const RESERVED_NAMES: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype', 'token-cache-key']);
 
 /**
  * When a connection carries a `companies` allowlist, its pinned companyId must be a

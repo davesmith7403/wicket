@@ -34,7 +34,8 @@ function readDoc(file: string): FileDoc {
     try {
         doc = JSON.parse(readFileSync(file, 'utf8'));
     } catch (err) {
-        throw new ConnectionsFileUnreadableError(file, err instanceof Error ? err.message : String(err));
+        // Never the parser's own message: it quotes the text around the error, which could be an inline secret.
+        throw new ConnectionsFileUnreadableError(file, err instanceof SyntaxError ? 'it is not valid JSON' : err instanceof Error ? err.message : String(err));
     }
     const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
     if (!isObject(doc) || !isObject(doc.connections)) {

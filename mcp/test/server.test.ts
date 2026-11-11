@@ -240,6 +240,33 @@ describe('operation tools', () => {
         expect(text).toContain(key);
     });
 
+    test('a server error on an action without a key hands over the minted key; a refusal does not', async () => {
+        // After a 5xx the server settles the key: only the same key is answered safely.
+        let calls = 0;
+        stub.rpc(() =>
+            ++calls === 1
+                ? odata({ type: 'https://wicket.example/errors/internal', title: 'Internal error', status: 500, detail: 'boom' })
+                : odata({ type: 'https://wicket.example/errors/action-failed', title: 'Action failed', status: 422, detail: 'no' }),
+        );
+        const failed = await call('wicket_action', { action: 'post-sales', target: { systemId: 'abc' } });
+        expect(failed.isError).toBe(true);
+        const key = envelopeOf(stub.rpcRequests[0]!).idempotencyKey as string;
+        expect(key).toMatch(/^auto-[0-9a-f-]{36}$/);
+        expect(toolJson(failed)).toMatchObject({ status: 500, '@idempotencyKey': key, '@idempotencyKeyGenerated': true });
+
+        // A 4xx is final and its snapshot replays: the retry of a corrected document needs a new key.
+        const refused = await call('wicket_action', { action: 'post-sales', target: { systemId: 'abc' } });
+        expect(refused.isError).toBe(true);
+        expect('@idempotencyKey' in (toolJson(refused) as Record<string, unknown>)).toBe(false);
+    });
+
+    test('a preview gets no minted key', async () => {
+        stub.rpc(() => odata({ preview: true }));
+        const res = await call('wicket_action', { action: 'post-sales', target: { systemId: 'abc' }, preview: true });
+        expect('idempotencyKey' in envelopeOf(stub.rpcRequests[0]!)).toBe(false);
+        expect('@idempotencyKeyGenerated' in (toolJson(res) as Record<string, unknown>)).toBe(false);
+    });
+
     test('a caller key is used verbatim and nothing is minted for insert/modify/delete', async () => {
         stub.rpc(() => odata({ ok: true }));
         const res = await call('wicket_action', { action: 'post-sales', idempotencyKey: 'post-42' });

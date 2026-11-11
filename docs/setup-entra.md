@@ -53,7 +53,7 @@ Without that user-permission-set assignment, the app principal exists but has ze
 
 ### Read vs. write vs. invoke
 
-The Wicket role sets (`Wicket - Read` / `Wicket - Execute` / `Wicket - Edit`) only grant access to Wicket's own tables, the API page and the operation handlers of that rung — they are the price of admission, not authority over your business data. `Wicket - Admin` is for the human who configures Wicket and `Wicket - Audit` for someone who must see the logs, the queue and the policy pages without changing them.
+The Wicket role sets (`Wicket - Read` / `Wicket - Execute` / `Wicket - Edit`) only grant access to Wicket's own tables, the API page and the operation handlers of that rung — they are the price of admission, not authority over your business data. `Wicket - Admin` is for the human who configures Wicket and `Wicket - Audit` for someone who must see the logs, the queue and the policy pages without changing them. `Wicket - Audit` and `Wicket - Audit Changes` are for people looking at pages: on their own they do not let an identity call the endpoint.
 
 - **Read** (`query`, `readBlob`, `describe`, `discover`) needs the app principal to hold **read** permission on the target tables, and those tables to be exposed for read in **Wicket Exposure** (or `Mode = Open` in **Wicket Setup**).
 - **Write** (`insert`, `modify`, `delete`, and `batch`, which carries many of them in one transaction) additionally needs the app principal to hold **write** (Insert/Modify/Delete) permission on the target tables, and the per-row `Allow Insert` / `Allow Modify` / `Allow Delete` flags set in **Wicket Exposure**. Both gates are independent: a missing tabledata write bit returns `422`, a missing exposure flag returns `403`.
@@ -118,7 +118,7 @@ Authorization: Bearer <token>
 | `401 / "User does not exist"` | Token is valid but you skipped step 2 — there's no Microsoft Entra Applications entry for this Client ID in this BC environment. |
 | `403 Forbidden` on a specific table | App principal exists but the assigned permission sets don't grant the table. Add a permission set to the Microsoft Entra Applications entry. |
 | `403` on `/api/wicket/rpc/v1.0/...` itself | No Wicket role set (`Wicket - Read` / `Wicket - Execute` / `Wicket - Edit`) was assigned. |
-| `403 role-forbidden` | The principal's Wicket role is below the operation: `Wicket - Read` cannot run mutating operations, `Wicket - Execute` cannot run the write plane. Assign the rung named in `detail`. |
+| `403 role-forbidden` | The principal's Wicket role is below the operation: `Wicket - Read` cannot run mutating operations, `Wicket - Execute` cannot run the write plane, and an identity holding only `Wicket - Audit` or `Wicket - Audit Changes` cannot call anything. Assign the set named in `detail`. |
 | `404` on `companies({id})` | Wrong company GUID, or the app principal doesn't have access to that company. |
 | `400 / "Invalid envelope"` | Token / auth is fine; the request body shape is wrong. Re-read `skills/wicket-usage/SKILL.md`. |
 

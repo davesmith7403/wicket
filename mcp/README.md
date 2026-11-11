@@ -37,7 +37,7 @@ problem) for the agent.
 | `wicket_changes` | `changes` | What the agent created, changed or deleted, and the actions it ran, old → new per field as the field policy allows (`from?`, `to?`, `tableId?`, `viaConnection?`, `kind?`, `user?` with Wicket - Audit Changes, `top?`, `cursor?`) |
 | `wicket_query_all` | `query` (looped) | Convenience: page a `query` to completion, concatenating every page up to `maxPages` / `maxRows` (no `aggregate`, no `deliver`) |
 | `wicket_connections` | — (local) | List the configured connections (name, tenant, environment, company, `authMode`, default, selected), plus any load `problem` and `rejected` entries |
-| `wicket_setup` | — (local, Entra, BC admin APIs) | Guided setup: `status` (silent health check), `locate` (tenant from a BC address, email or domain), `signin`, `environments`, `companies`, `save` (writes and tests the connection, live, no restart), `remove`, `setDefault`, `moveAsideBroken`. Driven by `/wicket:setup` in Claude Code |
+| `wicket_setup` | — (local, Entra, BC admin APIs) | Guided setup: `status` (silent health check), `locate` (tenant from a BC address, email or domain), `signin`, `environments`, `companies`, `save` (writes and tests the connection, live, no restart), `secretPage` (a local page to enter a client secret), `remove`, `setDefault`, `moveAsideBroken`. Driven by `/wicket:setup` in Claude Code |
 | `wicket_use` | — (local) | Switch the session's active connection (caveated; prefer the per-call `connection` override) |
 | `wicket_map` | `capabilities` (for `structureVersion`) | The tenant map: per-connection Markdown notes on solution tables (purpose, business key, joins, gotchas) — `read` / `upsert` / `remove` by `## ` section, structure only, stale when apps change |
 | `wicket_skill` | — (local) | The bundled usage guide (SKILL.md plus reference files), with progressive disclosure: `toc`, one `section` or one whole reference file, or `full` |
@@ -110,7 +110,7 @@ Wicket from the tool surface alone:
 - `mode: "toc"` (default) — the description, then every file with its section titles. Start here.
 - `mode: "section"`, `section: "<title>"` — one section (matched case-insensitively: exact, then
   prefix, then fuzzy), or one whole reference file by name (`"filters"`, `"errors"`, `"writes"`,
-  `"presenting"`, `"automation"`, `"tables"`, `"tools"`, `"protocol"`).
+  `"presenting"`, `"automation"`, `"tables"`, `"solutions"`, `"tools"`, `"protocol"`).
 - `mode: "full"` — the entire guide (large; prefer sections).
 
 After editing the skill run `bun run skill:sync`: it refreshes `skill/` and writes
@@ -183,8 +183,8 @@ object is not pageable.
 `query` (and `wicket_query_all`, which shares the schema) accepts two optional ISO 8601
 datetime strings that bound the platform's **`SystemModifiedAt`** field:
 
-- `modifiedAfter` — only rows modified **after** this instant.
-- `modifiedBefore` — only rows modified **before** this instant.
+- `modifiedAfter` — only rows modified **at or after** this instant.
+- `modifiedBefore` — only rows modified **at or before** this instant.
 
 Both are **ANDed with `filter`**, and together they are the **blessed incremental-sync
 pattern**: remember the max `SystemModifiedAt` you have seen and pass it as
@@ -383,7 +383,7 @@ Content-Type: application/json
 ```
 
 where the envelope is
-`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.6.1+<connection>", "data": { ... } }`.
+`{ "id": "<uuid>", "issuedAt": "<now ISO>", "origin": "mcp.wicket/2.6.2+<connection>", "data": { ... } }`.
 Business Central publishes a bound action only for simple parameter types, so the envelope
 crosses the wire as one string and the result comes back as one string in `value`.
 
@@ -564,8 +564,8 @@ server refuses to load it.
 A connection name must match `[A-Za-z0-9._-]` and be ≤ 64 chars (it is stamped into
 `origin`). `default` (optional) names the connection used when a call passes no
 `connection` and no `wicket_use` selection is active; it must name a configured
-connection or the server refuses to start (naming the bad value and the available
-connections). If omitted it is the env `default`, else the first entry.
+connection (a `default` that names none is reported as `dangling-default`, see below). If
+omitted it is the env `default`, else the first entry.
 
 ### Load-time validation
 
@@ -678,14 +678,17 @@ public-client `clientId`; omit every secret field.
   The flow keeps polling in the background; the retry after signing in picks up the
   token (a retry before sign-in repeats the same code). No call ever waits on the human
   for longer than that ~10 s window. After that MSAL caches and silently refreshes the
-  token, and the sign-in **survives server restarts**: MSAL's token cache is kept in the OS
-  keychain (via `@azure/identity-cache-persistence`; on macOS the entry
-  `Microsoft.Developer.IdentityService` / `MSALCache`) and the account record in
-  `~/.config/wicket/auth/<connection>.json` (mode 600; `$WICKET_AUTH_DIR` overrides).
+  token, and the sign-in **survives server restarts**. On macOS MSAL's token cache is an
+  encrypted file, `~/.config/wicket/auth/token-cache.bin` (AES-GCM), whose key is the Keychain
+  item `wicket` / `token-cache-key`; on Windows it is kept by `@azure/identity-cache-persistence`,
+  protected with DPAPI. The account record is in
+  `~/.config/wicket/auth/<connection>.json` (mode 600; `$WICKET_AUTH_DIR` overrides). To sign a
+  shared Mac out, delete those files and that Keychain item.
   You sign in again only when the refresh token lapses or the connection's tenant/client
   changes. Set `"persistTokenCache": false` on a connection to keep the token in memory only
-  (shared machines). If the keychain is unavailable the server warns on stderr and falls
-  back to memory. A sign-in that fails after you complete it (e.g. an AADSTS error) is
+  (shared machines). On Windows, if the protected store is unavailable the server warns on
+  stderr and falls back to memory; on macOS a Keychain that cannot give the key fails the
+  sign-in with that reason. A sign-in that fails after you complete it (e.g. an AADSTS error) is
   reported by the next call instead of a fresh code.
 - The `@azure/identity` dependency is loaded **lazily**: it is imported only when a
   `device_code` connection actually fetches a token, so a pure `client_credentials`
@@ -695,7 +698,7 @@ public-client `clientId`; omit every secret field.
 machine running the server (MSAL's `InteractiveBrowserCredential`, redirect to `http://localhost`),
 so there is no code to type. Everything else is shared with `device_code`: the non-blocking first
 call (the `401 sign-in-required` problem says a window opened, with no `userCode`), the persisted
-token cache (the Keychain on macOS, DPAPI on Windows) and the account record in `~/.config/wicket/auth/<connection>.json`. It needs
+token cache (an encrypted file keyed from the Keychain on macOS, DPAPI on Windows) and the account record in `~/.config/wicket/auth/<connection>.json`. It needs
 a desktop session; over SSH use `device_code`. For both delegated modes `clientId` is optional and
 defaults to Wicket's default public client `1950a258-227b-4e31-a9cf-717495945fc2`.
 

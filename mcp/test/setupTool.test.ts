@@ -367,7 +367,7 @@ describe('wicket_setup', () => {
         const before = readFileSync(file, 'utf8');
         await start();
         await setup({ action: 'signin', method: 'client_credentials', tenantId: TID, clientId: 'app-1', keychainService: 'wicket', keychainAccount: 'x' });
-        for (const name of ['__proto__', 'constructor', 'prototype']) {
+        for (const name of ['__proto__', 'constructor', 'prototype', 'token-cache-key']) {
             const saved = await setup({ action: 'save', name, environment: 'Production', companyId: COMPANY_A });
             expect(toolIsError(saved)).toBe(true);
             expect(toolText(saved)).toMatch(/is invalid/);

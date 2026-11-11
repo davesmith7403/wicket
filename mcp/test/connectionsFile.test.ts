@@ -112,6 +112,16 @@ describe('upsertConnection', () => {
         seed('{ not json');
         expect(() => upsertConnection('a', entry(), { replace: false })).toThrow(ConnectionsFileUnreadableError);
         expect(readFileSync(file, 'utf8')).toBe('{ not json');
+        // The parser quotes the text around the error, which could be an inline secret: never repeated.
+        seed('{ "connections": { "a": { "clientSecret": abcSECRET } } }');
+        let message = '';
+        try {
+            upsertConnection('a', entry(), { replace: false });
+        } catch (err) {
+            message = String((err as Error).message);
+        }
+        expect(message).toContain('not valid JSON');
+        expect(message).not.toContain('abcSECRET');
         expect(existsSync(`${file}.bak`)).toBe(false);
     });
 });

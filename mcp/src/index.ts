@@ -90,7 +90,7 @@ export { bundleSkill, findSkillSection, instructionsFrom, loadSkillDoc, parseSki
 // ---------------------------------------------------------------------------
 
 /** Bumped with the package version; stamped into the envelope origin. */
-export const SERVER_VERSION = '2.6.1';
+export const SERVER_VERSION = '2.6.2';
 
 /** Cap on one RPC POST — a hung gateway must not block a tool call forever. */
 export const RPC_TIMEOUT_MS = 120_000;
@@ -225,7 +225,7 @@ export class WicketClient {
      *
      * `idempotencyKey` is an optional caller-supplied token placed on the envelope. The AL
      * dispatcher honours it for EVERY operation (insert/modify/delete/invoke/action and a
-     * query deliver submit are where it matters). We never auto-generate it: a retry with the
+     * query deliver submit are where it matters). This method never generates one (the tool layer mints one for invoke/action/batch): a retry with the
      * SAME key + same {operation,data} replays the stored result (the response carries
      * "@replayed": true); the same key with a different body yields a 409 idempotency-conflict
      * problem. The server reserves the key before executing, so a key runs at most once: a
@@ -689,6 +689,19 @@ export function withGeneratedKey(result: unknown, key: string): unknown {
         : { value: result, ...note };
 }
 
+/**
+ * A server error (5xx) on a call that carried a minted key: the wrapper may have committed before
+ * the error, and the server settles the key so that only the SAME key is answered safely (409
+ * idempotency-indeterminate instead of a second run). The agent never saw the key, so hand it over
+ * with the problem. A 4xx is a final refusal the agent retries with a NEW key, so it gets none.
+ */
+export function withGeneratedKeyOnFailure(err: unknown, key: string): unknown {
+    if (!(err instanceof WicketProblemError)) return err;
+    const status = err.problem.status;
+    if (typeof status !== 'number' || status < 500 || '@idempotencyKey' in err.problem) return err;
+    return new WicketProblemError({ ...err.problem, '@idempotencyKey': key, '@idempotencyKeyGenerated': true });
+}
+
 export function ok(result: unknown): CallToolResult {
     const text = typeof result === 'string' ? result : renderJson(result);
     return { content: [{ type: 'text', text }] };
@@ -815,7 +828,7 @@ const ValuesObject = z.record(JsonValue);
 
 // Optional caller-supplied idempotency token for write-ish tools (insert/modify/delete/invoke/
 // action and wicket_query_deliver — the AL dispatcher honours it on every operation, but only a
-// state-changing call needs it). Placed on the envelope, NOT in data. Never auto-generated. A retry with the same key + same
+// state-changing call needs it). Placed on the envelope, NOT in data. Minted for invoke/action/batch when the agent sends none (AUTO_KEY_OPERATIONS). A retry with the same key + same
 // {operation,data} replays the stored result ("@replayed": true); same key + different body → 409
 // idempotency-conflict; same key while the first request is still running → 409
 // idempotency-in-progress; earlier outcome unknowable → 409 idempotency-indeterminate (the server
@@ -829,8 +842,9 @@ const IdempotencyKey = z
             'safely replay the stored result (response carries "@replayed": true); the same key with a ' +
             'different body returns a 409 idempotency-conflict; while the first request is still running, ' +
             'a 409 idempotency-in-progress (wait and resend); if the earlier outcome is unknowable, a 409 ' +
-            'idempotency-indeterminate (query the records, then retry with a NEW key). Omit to skip ' +
-            'idempotency semantics.',
+            'idempotency-indeterminate (query the records, then retry with a NEW key). When omitted, ' +
+            'invoke, action and batch get a minted key (returned as @idempotencyKey; previews get none); ' +
+            'the other tools run without idempotency.',
     );
 
 // Per-call connection override — the PREFERRED, race-free way to target a specific
@@ -1268,6 +1282,12 @@ export const QUERY_ALL_MAX_ROWS = 50_000;
 const queryAllSchema = {
     ...ConnectionOverride,
     ...queryPageableSchema,
+    top: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Page size of each request (default 100, capped at Max Top). Not a row limit: the walk goes on to maxRows.'),
     maxPages: z
         .number()
         .int()
@@ -1327,6 +1347,8 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
             name,
             { title, description, inputSchema: schema, annotations },
             async (raw: Record<string, unknown>): Promise<CallToolResult> => {
+                let generated = false;
+                let key: string | undefined;
                 try {
                     const refused = refuse?.(raw ?? {});
                     if (refused) return fail(new WicketProblemError(refused));
@@ -1342,12 +1364,15 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
                     // response cannot be retried without risking a second posting. When the agent
                     // sent none, mint one and say so — in the result, and (through the client's retry
                     // guidance) in any timeout/transport problem — so the retry can reuse it.
-                    const generated = idempotencyKey === undefined && AUTO_KEY_OPERATIONS.has(operation);
-                    const key = generated ? `auto-${randomUUID()}` : (idempotencyKey as string | undefined);
+                    // A preview runs inside the server's forced rollback and needs no key; a key would
+                    // only make the server store the preview's whole answer for the retention period.
+                    generated =
+                        idempotencyKey === undefined && AUTO_KEY_OPERATIONS.has(operation) && rest.preview !== true;
+                    key = generated ? `auto-${randomUUID()}` : (idempotencyKey as string | undefined);
                     const result = await client.call(operation, compact(rest), key);
                     return ok(generated ? withGeneratedKey(result, key as string) : result);
                 } catch (err) {
-                    return fail(err);
+                    return fail(generated ? withGeneratedKeyOnFailure(err, key as string) : err);
                 }
             },
         );
@@ -1941,7 +1966,7 @@ export function buildServer(pool: ClientPool, registry: ConnectionRegistry, opti
             description:
                 'List the configured Wicket connections (name, tenant, environment, company, ' +
                 'authMode, readOnly, unmask (only when set; false = this connection ignores its unmask grants), which is default, which is currently selected). Secrets are never ' +
-                'shown. A readOnly connection refuses insert/modify/delete/invoke/action client-side. ' +
+                'shown. A readOnly connection refuses insert/modify/delete/batch/invoke/action client-side (previews and non-mutating actions still run). ' +
                 'To target a connection, PREFER passing `connection` on any tool for that one call ' +
                 '(race-free); wicket_use switches the whole session but is a caveated convenience.',
             inputSchema: {},

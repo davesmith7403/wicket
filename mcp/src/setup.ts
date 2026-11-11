@@ -285,7 +285,13 @@ export class SetupSession {
             return token.token;
         };
         flow.result = acquire().then(
-            (token) => (flow.settled = { token }),
+            (token) => {
+                // The token names the real tenant. Recorded here, not only when a later signin call
+                // reports it: a caller that goes straight on to save must not write "organizations".
+                const tid = claimsOf(token).tid;
+                if (typeof tid === 'string' && tid) flow.target = { ...flow.target, tenantId: tid };
+                return (flow.settled = { token });
+            },
             (error: unknown) => (flow.settled = { error }),
         );
         return flow;
@@ -532,7 +538,7 @@ export function explainAuthError(err: unknown): string {
         return "Business Central doesn't know this user (or app) in that environment: the BC admin must add it.";
     }
     if (status === 403) {
-        return 'Signed in, but there is no Wicket permission set: the BC admin assigns Wicket - Read (or Execute/Edit).';
+        return 'Signed in, but this user holds no Wicket caller set: the BC admin assigns Wicket - Read (or Execute/Edit). Wicket - Audit alone opens pages, not the endpoint.';
     }
     if (status === 404) {
         return "Wicket isn't installed in that environment, or the environment or company name is wrong.";
